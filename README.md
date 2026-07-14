@@ -80,4 +80,4 @@ connection.close()
 |---|---|
 | TLS / SSL | Not implemented |
 | Automatic reconnect | Not implemented |
-| Connection pooling | Use `minamoto-pool` |
+| Connection pooling | Not provided at this layer |

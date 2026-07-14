@@ -42,7 +42,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
           GITHUB_ACTOR: ${{ github.actor }}
-          GHA_READ_PACKAGES_TOKEN: ${{ secrets.GHA_READ_PACKAGES_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GHA_READ_PACKAGES_TOKEN }}
 
       - name: Publish to GitHub Packages
         run: ./gradlew publish

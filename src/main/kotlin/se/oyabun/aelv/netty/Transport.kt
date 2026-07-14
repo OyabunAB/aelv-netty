@@ -16,14 +16,25 @@
 package se.oyabun.aelv.netty
 
 import io.netty.bootstrap.Bootstrap
+import io.netty.buffer.ByteBuf
 import io.netty.channel.Channel
+import io.netty.channel.ChannelFuture
+import io.netty.channel.ChannelHandlerContext
+import io.netty.channel.ChannelInboundHandlerAdapter
 import io.netty.channel.ChannelInitializer
 import io.netty.channel.MultiThreadIoEventLoopGroup
 import io.netty.channel.nio.NioIoHandler
 import io.netty.channel.socket.SocketChannel
 import io.netty.channel.socket.nio.NioSocketChannel
 import kotlinx.coroutines.suspendCancellableCoroutine
+import org.reactivestreams.Publisher
+import org.reactivestreams.Subscriber
+import org.reactivestreams.Subscription
+import se.oyabun.aelv.Many
+import se.oyabun.aelv.None
 import se.oyabun.aelv.One
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -38,38 +49,172 @@ import kotlin.coroutines.resumeWithException
  */
 class NettyTransport(eventLoopThreads: Int = 1) {
 
+    private val log   = Logging.of<NettyTransport>()
     private val group = MultiThreadIoEventLoopGroup(eventLoopThreads, NioIoHandler.newFactory())
 
     /**
-     * Establishes a TCP connection to [host]:[port].
+     * Establishes a TCP connection to [host]:[port], returning a [NettyConnection].
      *
-     * The returned [Channel] has auto-read disabled. Call [Channel.inbound] to start
-     * receiving data with backpressure, and [Channel.write] to send.
+     * The [InboundHandler] is installed during [ChannelInitializer.initChannel] — before
+     * [channelRegistered] and [channelActive] fire — so no lifecycle events are missed.
      */
-    fun connect(host: String, port: Int): One<Channel> = One.defer {
+    fun connect(host: String, port: Int): One<NettyConnection> = One.defer(context = NettyDispatchers.io) {
+        log.channel.connecting(host, port)
         suspendCancellableCoroutine { continuation ->
+            val handler = InboundHandler()
             val bootstrap = Bootstrap()
                 .group(group)
                 .channel(NioSocketChannel::class.java)
                 .handler(object : ChannelInitializer<SocketChannel>() {
                     override fun initChannel(ch: SocketChannel) {
                         ch.config().setAutoRead(false)
+                        ch.pipeline().addLast(handler)
                     }
                 })
 
             bootstrap.connect(host, port).addListener { future ->
-                if (future.isSuccess) continuation.resume((future as io.netty.channel.ChannelFuture).channel())
-                else continuation.resumeWithException(future.cause())
+                if (future.isSuccess) {
+                    val ch = (future as ChannelFuture).channel()
+                    log.channel.connected(ch.id(), ch.remoteAddress())
+                    continuation.resume(NettyConnection(ch, handler))
+                } else continuation.resumeWithException(future.cause())
             }
         }
     }
 
-    fun close(): One<Unit> = One.defer {
+    fun close(): One<Unit> = One.defer(context = NettyDispatchers.io) {
         suspendCancellableCoroutine { continuation ->
             group.shutdownGracefully().addListener { future ->
                 if (future.isSuccess) continuation.resume(Unit)
                 else continuation.resumeWithException(future.cause())
             }
+        }
+    }
+}
+
+/**
+ * A connected Netty TCP channel with its [InboundHandler] pre-installed in the pipeline.
+ */
+class NettyConnection(
+    val channel: Channel,
+    internal val handler: InboundHandler,
+)
+
+/**
+ * Bridges a Netty channel's inbound byte stream into an aelv [Many].
+ *
+ * Installed in the pipeline during [ChannelInitializer.initChannel] so it is present
+ * for all lifecycle events.
+ *
+ * Backpressure propagates via `autoRead`: when downstream has demand, `autoRead=true`
+ * lets Netty push data; when demand is exhausted, `autoRead=false` stops reads at the
+ * TCP level. This mirrors reactor-netty's approach and avoids the timing issues of
+ * single-shot `channel.read()` calls.
+ */
+class InboundHandler : ChannelInboundHandlerAdapter(), Publisher<ByteBuf> {
+
+    private val log        = Logging.of<InboundHandler>()
+    private val demand     = AtomicLong(0L)
+    private val cancelled  = AtomicBoolean(false)
+    private val terminated = AtomicBoolean(false)
+
+    @Volatile private var subscriber: Subscriber<in ByteBuf>? = null
+    @Volatile private var ctx: ChannelHandlerContext?         = null
+
+    override fun subscribe(sub: Subscriber<in ByteBuf>) {
+        require(subscriber == null) { "InboundHandler only supports a single subscriber" }
+        subscriber = sub
+        sub.onSubscribe(object : Subscription {
+            override fun request(n: Long) {
+                if (n <= 0L) {
+                    sub.onError(IllegalArgumentException("request must be positive, got $n (RS spec §3.9)"))
+                    return
+                }
+                log.inbound.demand(n)
+                val prev = demand.getAndAdd(n)
+                if (prev == 0L && !cancelled.get()) {
+                    log.inbound.demandSignalled(ctx?.channel()?.id() ?: return)
+                    ctx?.let { c ->
+                        c.channel().eventLoop().execute {
+                            c.channel().config().setAutoRead(true)
+                        }
+                    }
+                }
+            }
+
+            override fun cancel() {
+                log.inbound.cancelled()
+                cancelled.set(true)
+                subscriber = null
+                ctx?.let { c -> c.channel().eventLoop().execute { c.channel().config().setAutoRead(false) } }
+            }
+        })
+    }
+
+    override fun handlerAdded(ctx: ChannelHandlerContext) {
+        this.ctx = ctx
+    }
+
+    override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
+        if (cancelled.get()) { (msg as ByteBuf).release(); return }
+        val sub = subscriber ?: run {
+            log.inbound.droppedNoSubscriber(ctx.channel().id(), (msg as ByteBuf).readableBytes())
+            (msg as ByteBuf).release()
+            return
+        }
+        val buf = msg as ByteBuf
+        buf.retain()
+        log.inbound.received(ctx.channel().id(), buf.readableBytes())
+        val remaining = demand.decrementAndGet()
+        if (remaining == 0L) {
+            log.inbound.demandExhausted(ctx.channel().id())
+            ctx.channel().config().setAutoRead(false)
+        }
+        sub.onNext(buf)
+    }
+
+    override fun channelRegistered(ctx: ChannelHandlerContext) {
+        log.channel.registered(ctx.channel().id())
+        super.channelRegistered(ctx)
+    }
+
+    override fun channelActive(ctx: ChannelHandlerContext) {
+        log.channel.active(ctx.channel().id())
+        super.channelActive(ctx)
+    }
+
+    override fun channelInactive(ctx: ChannelHandlerContext) {
+        log.channel.inactive(ctx.channel().id())
+        if (terminated.compareAndSet(false, true)) {
+            subscriber?.onComplete()
+        }
+    }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        val ex = if (cause is Exception) cause else RuntimeException(cause)
+        log.channel.error(ctx.channel().id(), ex)
+        if (terminated.compareAndSet(false, true)) {
+            subscriber?.onError(ex)
+        }
+    }
+}
+
+/** Returns the backpressure-aware inbound byte stream for this connection. */
+fun NettyConnection.inbound(): Many<ByteBuf> = Many.from(handler)
+
+/**
+ * Writes [buf] to the channel and flushes, suspending until Netty confirms completion.
+ *
+ * Runs on [NettyDispatchers.io] to avoid blocking the caller's dispatcher.
+ * The caller retains ownership of [buf] — release it after this call returns.
+ */
+fun NettyConnection.write(buf: ByteBuf): None<ByteBuf> = None.defer(context = NettyDispatchers.io) {
+    val log = Logging.of<NettyConnection>()
+    log.outbound.write(channel.id(), buf.readableBytes())
+    suspendCancellableCoroutine { continuation ->
+        channel.writeAndFlush(buf).addListener { future ->
+            if (future.isSuccess) { log.outbound.writeComplete(channel.id()); continuation.resume(Unit) }
+            else { log.outbound.writeFailed(channel.id(), future.cause()); continuation.resumeWithException(future.cause()) }
         }
     }
 }

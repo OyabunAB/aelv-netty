@@ -155,6 +155,12 @@ class InboundHandler : ChannelInboundHandlerAdapter(), Publisher<ByteBuf> {
         this.ctx = ctx
     }
 
+    /**
+     * Delivers an inbound [ByteBuf] to the subscriber.
+     *
+     * The [buf] has been `retain()`ed before `onNext` is called. The subscriber MUST call
+     * `buf.release()` after processing to avoid a Netty memory leak.
+     */
     override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
         if (cancelled.get()) { (msg as ByteBuf).release(); return }
         val sub = subscriber ?: run {

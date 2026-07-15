@@ -26,6 +26,7 @@ import io.netty.channel.MultiThreadIoEventLoopGroup
 import io.netty.channel.nio.NioIoHandler
 import io.netty.channel.socket.SocketChannel
 import io.netty.channel.socket.nio.NioSocketChannel
+import io.netty.util.concurrent.DefaultThreadFactory
 import kotlinx.coroutines.suspendCancellableCoroutine
 import org.reactivestreams.Publisher
 import org.reactivestreams.Subscriber
@@ -50,7 +51,7 @@ import kotlin.coroutines.resumeWithException
 class NettyTransport(eventLoopThreads: Int = 1) {
 
     private val log   = Logging.of<NettyTransport>()
-    private val group = MultiThreadIoEventLoopGroup(eventLoopThreads, NioIoHandler.newFactory())
+    private val group = MultiThreadIoEventLoopGroup(eventLoopThreads, DefaultThreadFactory("netty-io"), NioIoHandler.newFactory())
 
     /**
      * Establishes a TCP connection to [host]:[port], returning a [NettyConnection].

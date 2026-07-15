@@ -2,7 +2,7 @@
 kotlin       = "2.4.0"
 jvm          = "21"
 coroutines   = "1.11.0"
-aelv         = "1.0.0-rc.4"
+aelv         = "1.0.0-rc.5"
 netty        = "4.2.1.Final"
 slf4j        = "2.0.18"
 logback      = "1.5.18"
@@ -11,6 +11,7 @@ logback      = "1.5.18"
 aelv                 = { group = "se.oyabun",             name = "aelv",                    version.ref = "aelv" }
 netty_transport      = { group = "io.netty",              name = "netty-transport",          version.ref = "netty" }
 netty_buffer         = { group = "io.netty",              name = "netty-buffer",             version.ref = "netty" }
+netty_handler        = { group = "io.netty",              name = "netty-handler",            version.ref = "netty" }
 coroutines_core      = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core",  version.ref = "coroutines" }
 slf4j_api            = { group = "org.slf4j",             name = "slf4j-api",               version.ref = "slf4j" }
 logback_classic      = { group = "ch.qos.logback",        name = "logback-classic",         version.ref = "logback" }
@@ -19,7 +20,7 @@ kotlin_test_junit5   = { group = "org.jetbrains.kotlin",  name = "kotlin-test-ju
 coroutines_test      = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
 
 [bundles]
-api  = ["aelv", "netty_transport", "netty_buffer"]
+api  = ["aelv", "netty_transport", "netty_buffer", "netty_handler"]
 core = ["coroutines_core", "slf4j_api"]
 test = ["kotlin_test", "kotlin_test_junit5", "coroutines_test", "logback_classic"]
 

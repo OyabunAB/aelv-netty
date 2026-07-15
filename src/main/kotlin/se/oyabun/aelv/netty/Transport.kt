@@ -206,7 +206,35 @@ class InboundHandler : ChannelInboundHandlerAdapter(), Publisher<ByteBuf> {
     }
 }
 
-/** Returns the backpressure-aware inbound byte stream for this connection. */
+/**
+ * Reads exactly one byte from the channel, bypassing the normal inbound stream.
+ *
+ * Used for protocol-level handshakes that exchange a single raw byte before the
+ * framing layer is active — e.g. PGwire's TLS negotiation response ('S' or 'N').
+ *
+ * Pipeline modification and read trigger run on the event loop to ensure ordering.
+ */
+suspend fun NettyConnection.readRawByte(): Byte = suspendCancellableCoroutine { continuation ->
+    val eventLoop = channel.eventLoop()
+    eventLoop.execute {
+        channel.pipeline().addFirst("raw-byte-reader", object : io.netty.channel.ChannelInboundHandlerAdapter() {
+            override fun channelRead(ctx: io.netty.channel.ChannelHandlerContext, msg: Any) {
+                if (msg is io.netty.buffer.ByteBuf && msg.isReadable) {
+                    val byte = msg.readByte()
+                    msg.release()
+                    ctx.pipeline().remove(this)
+                    continuation.resume(byte)
+                }
+            }
+            override fun exceptionCaught(ctx: io.netty.channel.ChannelHandlerContext, cause: Throwable) {
+                ctx.pipeline().remove(this)
+                continuation.resumeWithException(cause)
+            }
+        })
+        channel.read()
+    }
+    continuation.invokeOnCancellation { /* handler will be removed on next read or connection close */ }
+}
 fun NettyConnection.inbound(): Many<ByteBuf> = Many.from(handler)
 
 /**

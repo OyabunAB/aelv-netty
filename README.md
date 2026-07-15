@@ -74,10 +74,29 @@ connection.write(myByteBuf)
 connection.close()
 ```
 
+## TLS
+
+`SslMode` controls TLS negotiation. Pass it when connecting:
+
+```kotlin
+val connection = transport.connect(host, port).await().rightOrThrow()
+// then in your protocol layer — e.g. PGwire SSLRequest/S exchange:
+connection.upgradeTls(SslMode.Require, host)
+```
+
+| Mode | Behaviour |
+|---|---|
+| `Disable` | No TLS |
+| `Prefer` | TLS if server supports it, plain otherwise |
+| `Require` | TLS required, no certificate verification |
+| `Verify` | TLS + certificate verification against trust store |
+| `VerifyFull` | TLS + certificate + hostname verification |
+
+`Verify` and `VerifyFull` accept an optional `trustStorePath` (PEM, JKS, or PKCS12). `null` uses the JVM default trust store.
+
 ## What is not included
 
-| Feature | Alternative |
+| Feature | Note |
 |---|---|
-| TLS / SSL | Not implemented |
 | Automatic reconnect | Not implemented |
 | Connection pooling | Not provided at this layer |

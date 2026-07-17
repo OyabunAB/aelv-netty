@@ -22,6 +22,7 @@ import io.netty.channel.ChannelFuture
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelInboundHandlerAdapter
 import io.netty.channel.ChannelInitializer
+import io.netty.channel.ChannelOption
 import io.netty.channel.MultiThreadIoEventLoopGroup
 import io.netty.channel.nio.NioIoHandler
 import io.netty.channel.socket.SocketChannel
@@ -59,13 +60,15 @@ class NettyTransport(eventLoopThreads: Int = 1) {
      * The [InboundHandler] is installed during [ChannelInitializer.initChannel] — before
      * [channelRegistered] and [channelActive] fire — so no lifecycle events are missed.
      */
-    fun connect(host: String, port: Int): One<NettyConnection> = One.defer(context = NettyDispatchers.io) {
+    fun connect(host: String, port: Int, tcpOptions: TcpOptions = TcpOptions()): One<NettyConnection> = One.defer(context = NettyDispatchers.io) {
         log.channel.connecting(host, port)
         suspendCancellableCoroutine { continuation ->
             val handler = InboundHandler()
             val bootstrap = Bootstrap()
                 .group(group)
                 .channel(NioSocketChannel::class.java)
+                .option(ChannelOption.TCP_NODELAY, tcpOptions.noDelay)
+                .option(ChannelOption.SO_KEEPALIVE, tcpOptions.keepAlive)
                 .handler(object : ChannelInitializer<SocketChannel>() {
                     override fun initChannel(ch: SocketChannel) {
                         ch.config().setAutoRead(false)
@@ -88,6 +91,37 @@ class NettyTransport(eventLoopThreads: Int = 1) {
             group.shutdownGracefully().addListener { future ->
                 if (future.isSuccess) continuation.resume(Unit)
                 else continuation.resumeWithException(future.cause())
+            }
+        }
+    }
+
+    /**
+     * Connects via a Unix domain socket at [path].
+     *
+     * Requires `netty-transport-native-epoll` on Linux or
+     * `netty-transport-native-kqueue` on macOS to be on the runtime classpath.
+     * Throws [UnsupportedOperationException] if neither is available.
+     */
+    fun connectUnix(path: String, tcpOptions: TcpOptions = TcpOptions()): One<NettyConnection> = One.defer(context = NettyDispatchers.io) {
+        log.channel.connecting(path, 0)
+        suspendCancellableCoroutine { continuation ->
+            val (channelClass, address) = resolveUnixChannel(path)
+            val handler   = InboundHandler()
+            val bootstrap = Bootstrap()
+                .group(group)
+                .channel(channelClass)
+                .handler(object : ChannelInitializer<Channel>() {
+                    override fun initChannel(ch: Channel) {
+                        ch.config().setAutoRead(false)
+                        ch.pipeline().addLast(handler)
+                    }
+                })
+            bootstrap.connect(address).addListener { future ->
+                if (future.isSuccess) {
+                    val ch = (future as ChannelFuture).channel()
+                    log.channel.connected(ch.id(), ch.remoteAddress())
+                    continuation.resume(NettyConnection(ch, handler))
+                } else continuation.resumeWithException(future.cause())
             }
         }
     }
@@ -231,10 +265,45 @@ suspend fun NettyConnection.readRawByte(): Byte = suspendCancellableCoroutine { 
                 continuation.resumeWithException(cause)
             }
         })
-        channel.read()
+         channel.read()
     }
     continuation.invokeOnCancellation { /* handler will be removed on next read or connection close */ }
 }
+
+/**
+ * Resolves the platform-appropriate Unix domain socket channel class and address.
+ *
+ * Checks for epoll (Linux) first, then kqueue (macOS). Throws [UnsupportedOperationException]
+ * if neither native transport is on the classpath.
+ */
+private fun resolveUnixChannel(path: String): Pair<Class<out Channel>, java.net.SocketAddress> {
+    runCatching {
+        val epollAvailable = Class.forName("io.netty.channel.epoll.Epoll")
+            .getMethod("isAvailable").invoke(null) as Boolean
+        if (epollAvailable) {
+            val channelClass = Class.forName("io.netty.channel.epoll.EpollDomainSocketChannel")
+                .asSubclass(Channel::class.java)
+            val address = Class.forName("io.netty.channel.unix.DomainSocketAddress")
+                .getConstructor(String::class.java).newInstance(path) as java.net.SocketAddress
+            return channelClass to address
+        }
+    }
+    runCatching {
+        val kqueueAvailable = Class.forName("io.netty.channel.kqueue.KQueue")
+            .getMethod("isAvailable").invoke(null) as Boolean
+        if (kqueueAvailable) {
+            val channelClass = Class.forName("io.netty.channel.kqueue.KQueueDomainSocketChannel")
+                .asSubclass(Channel::class.java)
+            val address = Class.forName("io.netty.channel.unix.DomainSocketAddress")
+                .getConstructor(String::class.java).newInstance(path) as java.net.SocketAddress
+            return channelClass to address
+        }
+    }
+    throw UnsupportedOperationException(
+        "Unix domain sockets require netty-transport-native-epoll (Linux) or netty-transport-native-kqueue (macOS) on the classpath"
+    )
+}
+
 fun NettyConnection.inbound(): Many<ByteBuf> = Many.from(handler)
 
 /**

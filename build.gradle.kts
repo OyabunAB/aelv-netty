@@ -18,6 +18,8 @@ val signingPassword: String? = System.getenv("GPG_SIGNING_PASSWORD")
 dependencies {
     api(libs.bundles.api)
     implementation(libs.bundles.core)
+    compileOnly("io.netty:netty-transport-native-epoll:${libs.versions.netty.get()}:linux-x86_64")
+    compileOnly("io.netty:netty-transport-native-kqueue:${libs.versions.netty.get()}:osx-x86_64")
     testImplementation(libs.bundles.test)
 }
 

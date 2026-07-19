@@ -17,11 +17,14 @@ package se.oyabun.aelv.netty
 
 import io.netty.handler.ssl.SslContext
 import io.netty.handler.ssl.SslContextBuilder
+import io.netty.handler.ssl.SslHandler
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.File
 import java.io.FileInputStream
 import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.cert.X509Certificate
 import javax.net.ssl.TrustManagerFactory
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -127,4 +130,40 @@ private fun loadTrustManagerFactory(trustStorePath: String?): TrustManagerFactor
     }
     return TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
         .also { it.init(keyStore) }
+}
+
+/**
+ * The channel binding data established during a TLS handshake.
+ *
+ * [None] — no TLS was negotiated; channel binding is unavailable.
+ * [TlsServerEndPoint] — TLS is active; [data] is `SHA-256(server_leaf_certificate_DER)`
+ * as defined by RFC 5929 §4, used by SCRAM-SHA-256-PLUS.
+ */
+sealed interface ChannelBinding {
+    data object None                                          : ChannelBinding
+    data class  TlsServerEndPoint(val digest: ByteArray)     : ChannelBinding
+}
+
+/** Returns the [SslHandler] installed in this connection's pipeline, or null if TLS is not active. */
+fun NettyConnection.sslHandler(): SslHandler? =
+    channel.pipeline().get(SslHandler::class.java)
+
+/**
+ * Computes the [ChannelBinding] for this connection.
+ *
+ * Returns [ChannelBinding.TlsServerEndPoint] with `SHA-256(server_leaf_certificate_DER)`
+ * when TLS is active, or [ChannelBinding.None] if TLS was not negotiated or no peer
+ * certificate is available.
+ */
+fun NettyConnection.channelBinding(): ChannelBinding {
+    val cert = sslHandler()
+        ?.engine()
+        ?.session
+        ?.peerCertificates
+        ?.takeIf { it.isNotEmpty() }
+        ?.get(0) as? X509Certificate
+        ?: return ChannelBinding.None
+    return ChannelBinding.TlsServerEndPoint(
+        MessageDigest.getInstance("SHA-256").digest(cert.encoded)
+    )
 }

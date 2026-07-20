@@ -23,8 +23,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import se.oyabun.aelv.await
-import se.oyabun.aelv.discard
-import se.oyabun.aelv.first
+import se.oyabun.aelv.firstMaybe
 import se.oyabun.aelv.getOrThrow
 import se.oyabun.aelv.map
 import java.net.ServerSocket
@@ -128,7 +127,7 @@ class TransportTest {
                         buffer.release()
                         bytes
                     }
-                    .first().getOrThrow()
+                    .firstMaybe().await().getOrThrow()!!
 
                 assertTrue(receivedBytes.isNotEmpty())
                 connection.channel.close().sync()

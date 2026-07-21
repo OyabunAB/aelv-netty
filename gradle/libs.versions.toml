@@ -6,6 +6,8 @@ aelv         = "1.0.0"
 netty        = "4.2.1.Final"
 slf4j        = "2.0.18"
 logback      = "1.5.18"
+jmh          = "1.37"
+jmh_plugin   = "0.7.3"
 
 [libraries]
 aelv                 = { group = "se.oyabun",             name = "aelv",                    version.ref = "aelv" }
@@ -19,6 +21,9 @@ kotlin_test          = { group = "org.jetbrains.kotlin",  name = "kotlin-test", 
 kotlin_test_junit5   = { group = "org.jetbrains.kotlin",  name = "kotlin-test-junit5",      version.ref = "kotlin" }
 coroutines_test      = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
 
+jmh_core             = { group = "org.openjdk.jmh",       name = "jmh-core",                   version.ref = "jmh" }
+jmh_annprocess       = { group = "org.openjdk.jmh",       name = "jmh-generator-annprocess",   version.ref = "jmh" }
+
 [bundles]
 api  = ["aelv", "netty_transport", "netty_buffer", "netty_handler"]
 core = ["coroutines_core", "slf4j_api"]
@@ -30,3 +35,4 @@ mavenPublish = { id = "maven-publish" }
 signing      = { id = "signing" }
 dokka        = { id = "org.jetbrains.dokka",                   version = "2.2.0" }
 nexusPublish = { id = "io.github.gradle-nexus.publish-plugin", version = "2.0.0" }
+jmh          = { id = "me.champeau.jmh",                        version.ref = "jmh_plugin" }

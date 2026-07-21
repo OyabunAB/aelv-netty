@@ -1,17 +1,24 @@
 # aelv-netty
 
-Netty TCP transport adapter for [aelv](https://github.com/OyabunAB/aelv). Provides a backpressure-aware inbound stream and write capability over a raw TCP channel.
-
-## Requirements
-
-- Kotlin 2.x
-- JVM 21+
-- GitHub Packages credentials (`GITHUB_ACTOR` / `GITHUB_TOKEN`)
+Netty TCP transport adapter for [aelv](https://github.com/OyabunAB/aelv). Provides a
+backpressure-aware inbound stream and write capability over a raw TCP channel. No Reactor,
+no Flux — just aelv primitives over Netty channels.
 
 ## Install
 
+Available on Maven Central and GitHub Packages.
+
 ```kotlin
 // build.gradle.kts
+dependencies {
+    implementation("se.oyabun:aelv:1.0.0")
+    implementation("se.oyabun:aelv-netty:1.0.0")
+}
+```
+
+For release candidates (GitHub Packages only):
+
+```kotlin
 repositories {
     maven {
         url = uri("https://maven.pkg.github.com/OyabunAB/aelv-netty")
@@ -21,67 +28,76 @@ repositories {
         }
     }
 }
-
-dependencies {
-    implementation("se.oyabun:aelv:1.0.0-rc.4")
-    implementation("se.oyabun:aelv-netty:<version>")
-}
 ```
 
 ## Components
 
 ### NettyTransport
 
-Entry point. Creates TCP connections and owns the Netty `NioEventLoopGroup`. One transport instance per application is typical.
+Entry point. Owns the Netty `EventLoopGroup`. One instance per application is typical;
+call `close()` on shutdown.
 
 ```kotlin
-val transport = NettyTransport()
+val transport = NettyTransport()                // 1 NIO event loop thread (sufficient for driver use)
+val transport = NettyTransport(threads = 4)     // explicit thread count
 ```
 
 ### NettyConnection
 
-A connected TCP channel. Exposes a `Publisher<ByteBuf>` inbound stream with backpressure and a write function.
-
-### NettyDispatchers
-
-Two coroutine dispatchers backed by Netty threads:
-
-| Dispatcher | Backed by |
-|---|---|
-| `NettyDispatchers.io` | Netty event loop threads |
-| `NettyDispatchers.connection` | aelv connection processing threads |
+A connected TCP channel. Exposes a backpressure-aware `Many<ByteBuf>` inbound stream and
+a write function.
 
 ### InboundHandler
 
-Installed in the Netty pipeline. Receives `ByteBuf` frames from Netty and delivers them downstream as a `Publisher<ByteBuf>` with demand-driven backpressure. Demand is propagated back to the channel's read interest.
+Installed in the Netty pipeline by `NettyTransport.connect()`. Bridges Netty's push-based
+`channelRead` into an aelv reactive stream with demand-driven backpressure. When downstream
+has demand, `autoRead=true` lets Netty push frames; when demand is exhausted, `autoRead=false`
+halts reads at the TCP level.
+
+**Buffer ownership**: the `ByteBuf` delivered to `onNext` has refcnt=1. The subscriber
+must call `buf.release()` after processing.
+
+### NettyDispatchers
+
+Two coroutine dispatchers for Netty operations:
+
+| Name | Backed by | Used for |
+|---|---|---|
+| `NettyDispatchers.io` | Fixed thread pool (`availableProcessors` threads) | connect, write, close |
+| `NettyDispatchers.inbound` | Single thread | inbound message processing |
 
 ## Usage
 
 ```kotlin
 val transport = NettyTransport()
 
-val connection: NettyConnection = transport.connect("db.example.com", 5432).get()
+// Connect
+val connection = transport.connect("db.example.com", 5432).await().rightOrThrow()
 
-// Consume inbound frames
+// Consume inbound frames (backpressure-aware)
 connection.inbound()
-    .map { buf -> buf.readBytes(buf.readableBytes()) }
+    .map { buf ->
+        val bytes = ByteArray(buf.readableBytes()).also { buf.readBytes(it) }
+        buf.release()
+        bytes
+    }
     .subscribe(mySubscriber)
 
 // Write outbound data
-connection.write(myByteBuf)
+connection.write(myByteBuf).await().rightOrThrow()
 
-// Close
-connection.close()
+// Shutdown
+connection.channel.close().sync()
+transport.close().await().rightOrThrow()
 ```
 
 ## TLS
 
-`SslMode` controls TLS negotiation. Pass it when connecting:
+`SslMode` controls TLS negotiation. Pass it to `upgradeTls` after any protocol-level
+TLS handshake byte exchange (e.g. PGwire `SSLRequest`/`S`):
 
 ```kotlin
-val connection = transport.connect(host, port).await().rightOrThrow()
-// then in your protocol layer — e.g. PGwire SSLRequest/S exchange:
-connection.upgradeTls(SslMode.Require, host)
+connection.upgradeTls(SslMode.VerifyFull(), serverHostname = host)
 ```
 
 | Mode | Behaviour |
@@ -89,14 +105,48 @@ connection.upgradeTls(SslMode.Require, host)
 | `Disable` | No TLS |
 | `Prefer` | TLS if server supports it, plain otherwise |
 | `Require` | TLS required, no certificate verification |
-| `Verify` | TLS + certificate verification against trust store |
-| `VerifyFull` | TLS + certificate + hostname verification |
+| `Verify(trustStorePath?)` | TLS + certificate verification |
+| `VerifyFull(trustStorePath?)` | TLS + certificate + hostname verification |
 
-`Verify` and `VerifyFull` accept an optional `trustStorePath` (PEM, JKS, or PKCS12). `null` uses the JVM default trust store.
+`trustStorePath` accepts PEM, JKS, or PKCS12 files. `null` uses the JVM default trust store.
+
+## Unix domain sockets
+
+Requires `netty-transport-native-epoll` (Linux) or `netty-transport-native-kqueue` (macOS)
+on the classpath:
+
+```kotlin
+// build.gradle.kts
+runtimeOnly("io.netty:netty-transport-native-epoll:4.x:linux-x86_64")
+```
+
+```kotlin
+val connection = transport.connectUnix("/var/run/postgresql/.s.PGSQL.5432").await().rightOrThrow()
+```
+
+## Low-level byte reads
+
+`readRawByte()` reads a single raw byte outside the normal inbound stream. Used for
+protocol handshakes before framing is active:
+
+```kotlin
+val response = connection.readRawByte() // e.g. 'S'=TLS ok, 'N'=TLS declined
+```
+
+## Benchmarks
+
+Run with:
+
+```
+./gradlew :jmh
+```
+
+Results land in `build/reports/jmh/results.json`.
 
 ## What is not included
 
 | Feature | Note |
 |---|---|
-| Automatic reconnect | Not implemented |
+| Automatic reconnect | Handle at the driver layer |
 | Connection pooling | Not provided at this layer |
+| HTTP/WebSocket | TCP only |

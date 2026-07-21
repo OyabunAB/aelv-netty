@@ -6,6 +6,7 @@ plugins {
     alias(libs.plugins.signing)
     alias(libs.plugins.dokka)
     alias(libs.plugins.nexusPublish)
+    alias(libs.plugins.jmh)
 }
 
 version = System.getenv("VERSION") ?: "0.0.0-SNAPSHOT"
@@ -21,6 +22,7 @@ dependencies {
     compileOnly("io.netty:netty-transport-native-epoll:${libs.versions.netty.get()}:linux-x86_64")
     compileOnly("io.netty:netty-transport-native-kqueue:${libs.versions.netty.get()}:osx-x86_64")
     testImplementation(libs.bundles.test)
+    jmh(libs.jmh.annprocess)
 }
 
 kotlin {
@@ -30,6 +32,22 @@ kotlin {
 val jvmTargetVersion = JvmTarget.fromTarget(libs.versions.jvm.get())
 tasks.compileKotlin { compilerOptions { jvmTarget.set(jvmTargetVersion) } }
 tasks.compileTestKotlin { compilerOptions { jvmTarget.set(jvmTargetVersion) } }
+
+tasks.named("compileJmhKotlin") {
+    (this as org.jetbrains.kotlin.gradle.tasks.KotlinCompile)
+        .compilerOptions { jvmTarget.set(jvmTargetVersion) }
+}
+
+jmh {
+    warmupIterations.set(3)
+    warmup.set("5s")
+    iterations.set(5)
+    timeOnIteration.set("10s")
+    fork.set(1)
+    resultFormat.set("JSON")
+    resultsFile.set(project.file("${project.layout.buildDirectory.get()}/reports/jmh/results.json"))
+    jvmArgsAppend.add("-Dorg.slf4j.simpleLogger.log.org.openjdk.jmh=WARN")
+}
 
 tasks.test {
     useJUnitPlatform()

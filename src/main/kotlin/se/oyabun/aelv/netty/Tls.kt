@@ -70,9 +70,8 @@ sealed interface SslMode {
  */
 suspend fun NettyConnection.upgradeTls(mode: SslMode, serverHostname: String) {
     val sslContext = buildSslContext(mode, serverHostname)
-    val sslEngine  = sslContext.newEngine(channel.alloc(), serverHostname, channel.remoteAddress().let {
-        (it as? java.net.InetSocketAddress)?.port ?: 5432
-    })
+    val port       = (channel.remoteAddress() as? java.net.InetSocketAddress)?.port ?: -1
+    val sslEngine  = sslContext.newEngine(channel.alloc(), serverHostname, port)
 
     val sslHandler = io.netty.handler.ssl.SslHandler(sslEngine)
 
@@ -116,13 +115,14 @@ private fun loadTrustManagerFactory(trustStorePath: String?): TrustManagerFactor
             ks
         }
         else -> {
-            // Treat as PEM — load cert and add to a KeyStore
             return TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
                 .also { tmf ->
                     val ks   = KeyStore.getInstance(KeyStore.getDefaultType())
                     ks.load(null)
-                    val cert = java.security.cert.CertificateFactory.getInstance("X.509")
-                        .generateCertificate(FileInputStream(file))
+                    val cert = FileInputStream(file).use { stream ->
+                        java.security.cert.CertificateFactory.getInstance("X.509")
+                            .generateCertificate(stream)
+                    }
                     ks.setCertificateEntry("ca", cert)
                     tmf.init(ks)
                 }

@@ -15,8 +15,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    env:
-      GITHUB_TOKEN: ${{ secrets.GHA_READ_PACKAGES_TOKEN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -24,6 +22,15 @@ jobs:
         with:
           java-version: '21'
           distribution: temurin
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle.kts', '**/libs.versions.toml') }}
+          restore-keys: ${{ runner.os }}-gradle-
 
       - name: Extract version
         id: version
@@ -44,22 +51,26 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
           GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GHA_READ_PACKAGES_TOKEN }}
 
-      - name: Publish to GitHub Packages
-        run: ./gradlew publish
+      - name: Publish and stage to Maven Central (release manually at central.sonatype.com)
+        if: ${{ !contains(steps.version.outputs.version, '-') }}
+        run: ./gradlew publishToSonatype closeSonatypeStagingRepository
         env:
           VERSION: ${{ steps.version.outputs.version }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
           GPG_SIGNING_PASSWORD: ${{ secrets.GPG_SIGNING_PASSWORD }}
-
-      - name: Publish to Maven Central
-        if: ${{ !contains(steps.version.outputs.version, '-') }}
-        run: ./gradlew publishToSonatype closeAndReleaseSonatypeStagingRepository
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
           OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
           OSSRH_PASSWORD: ${{ secrets.OSSRH_PASSWORD }}
+
+      - name: Publish GitHub Packages only (RC)
+        if: ${{ contains(steps.version.outputs.version, '-') }}
+        run: ./gradlew publishMavenPublicationToGitHubPackagesRepository
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
           GPG_SIGNING_PASSWORD: ${{ secrets.GPG_SIGNING_PASSWORD }}

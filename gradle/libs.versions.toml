@@ -2,7 +2,7 @@
 kotlin       = "2.4.0"
 jvm          = "21"
 coroutines   = "1.11.0"
-aelv         = "1.0.0-rc.7"
+aelv         = "1.0.0"
 netty        = "4.2.1.Final"
 slf4j        = "2.0.18"
 logback      = "1.5.18"

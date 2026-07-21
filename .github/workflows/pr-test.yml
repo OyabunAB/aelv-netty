@@ -1,6 +1,8 @@
 name: pr test
 
 on:
+  push:
+    branches: [master]
   pull_request:
     branches: [master]
 
@@ -31,4 +33,5 @@ jobs:
         run: ./gradlew check
         env:
           GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GHA_READ_PACKAGES_TOKEN }}
           GHA_READ_PACKAGES_TOKEN: ${{ secrets.GHA_READ_PACKAGES_TOKEN }}

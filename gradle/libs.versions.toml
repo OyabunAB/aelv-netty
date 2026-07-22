@@ -1,5 +1,5 @@
 [versions]
-kotlin       = "2.4.0"
+kotlin       = "2.4.10"
 jvm          = "21"
 coroutines   = "1.11.0"
 aelv         = "1.0.1"

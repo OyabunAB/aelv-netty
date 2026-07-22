@@ -7,14 +7,12 @@ import org.openjdk.jmh.annotations.Benchmark
 import org.openjdk.jmh.annotations.BenchmarkMode
 import org.openjdk.jmh.annotations.Fork
 import org.openjdk.jmh.annotations.Level
-import org.openjdk.jmh.annotations.Measurement
 import org.openjdk.jmh.annotations.Mode
 import org.openjdk.jmh.annotations.OutputTimeUnit
 import org.openjdk.jmh.annotations.Scope
 import org.openjdk.jmh.annotations.Setup
 import org.openjdk.jmh.annotations.State
 import org.openjdk.jmh.annotations.TearDown
-import org.openjdk.jmh.annotations.Warmup
 import se.oyabun.aelv.await
 import se.oyabun.aelv.firstMaybe
 import se.oyabun.aelv.map
@@ -26,15 +24,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Measures raw TCP round-trip throughput using aelv-netty.
  *
- * The echo server runs in a background thread; each benchmark iteration
- * writes a frame and reads the echoed response.
- *
  * Run with: `./gradlew :jmh`
+ * Results: build/reports/jmh/results.json
  */
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.SECONDS)
-@Warmup(iterations = 3, time = 5, timeUnit = TimeUnit.SECONDS)
-@Measurement(iterations = 5, time = 10, timeUnit = TimeUnit.SECONDS)
 @Fork(1)
 @State(Scope.Benchmark)
 open class TransportBenchmarks {

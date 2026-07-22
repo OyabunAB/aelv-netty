@@ -23,9 +23,9 @@ import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelInboundHandlerAdapter
 import io.netty.channel.ChannelInitializer
 import io.netty.channel.ChannelOption
+import io.netty.channel.IoHandlerFactory
 import io.netty.channel.MultiThreadIoEventLoopGroup
 import io.netty.channel.nio.NioIoHandler
-import io.netty.channel.socket.SocketChannel
 import io.netty.channel.socket.nio.NioSocketChannel
 import io.netty.util.concurrent.DefaultThreadFactory
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -35,6 +35,7 @@ import org.reactivestreams.Subscription
 import se.oyabun.aelv.Many
 import se.oyabun.aelv.None
 import se.oyabun.aelv.One
+import java.net.SocketAddress
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -43,152 +44,135 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /**
- * A lightweight Netty TCP transport.
+ * Lightweight Netty TCP transport.
  *
- * Owns a NIO [MultiThreadIoEventLoopGroup] for TCP connections and, if Unix domain
- * socket support is requested at runtime, a lazily-created native group backed by
- * Epoll (Linux) or KQueue (macOS). Both groups are shut down by [close].
+ * Owns a NIO [MultiThreadIoEventLoopGroup] for TCP connections. If [connectUnix] is
+ * called, a native group (Epoll on Linux, KQueue on macOS) is created on first use and
+ * reused for all subsequent Unix connections. Both groups are shut down by [close].
  *
- * [eventLoopThreads] defaults to 1 — for database driver use cases a single event loop
- * thread is sufficient since each connection is pipelined and the coroutine runtime
- * handles concurrency above the transport layer.
+ * [eventLoopThreads] defaults to 1. For database driver use cases one event loop
+ * thread is sufficient — pipelining and coroutine concurrency live above this layer.
  */
 class NettyTransport(eventLoopThreads: Int = 1) {
 
-    private val log   = Logging.of<NettyTransport>()
+    private val log = Logging.of<NettyTransport>()
+
     private val group = MultiThreadIoEventLoopGroup(
         eventLoopThreads, DefaultThreadFactory("netty-io"), NioIoHandler.newFactory()
     )
 
-    // Lazily created on first connectUnix() call; null if no native transport is available.
-    private val nativeGroup: MultiThreadIoEventLoopGroup? by lazy { resolveNativeGroup(1) }
+    // Created on first connectUnix call; null until then so close() does not spin
+    // up threads just to destroy them immediately.
+    private val nativeGroupRef = AtomicReference<MultiThreadIoEventLoopGroup?>(null)
 
     /**
-     * Establishes a TCP connection to [host]:[port], returning a [NettyConnection].
+     * Establishes a TCP connection to [host]:[port].
      *
-     * The [InboundHandler] is installed during [ChannelInitializer.initChannel] — before
-     * [Channel.channelRegistered] and [Channel.channelActive] fire — so no lifecycle
-     * events are missed.
-     *
-     * If the coroutine is cancelled while the TCP handshake is in flight, the half-opened
-     * channel is closed immediately.
+     * If cancelled while the handshake is in flight, the half-opened channel is closed.
      */
     fun connect(host: String, port: Int, tcpOptions: TcpOptions = TcpOptions()): One<NettyConnection> =
         One.defer(context = NettyDispatchers.io) {
-            log.channel.connecting(host, port)
-            suspendCancellableCoroutine { continuation ->
-                val handler    = InboundHandler()
-                val bootstrap  = Bootstrap()
-                    .group(group)
-                    .channel(NioSocketChannel::class.java)
-                    .option(ChannelOption.TCP_NODELAY, tcpOptions.noDelay)
-                    .option(ChannelOption.SO_KEEPALIVE, tcpOptions.keepAlive)
-                    .handler(object : ChannelInitializer<SocketChannel>() {
-                        override fun initChannel(ch: SocketChannel) {
-                            ch.config().setAutoRead(false)
-                            ch.pipeline().addLast(handler)
-                        }
-                    })
-                val connectFuture = bootstrap.connect(host, port)
-                continuation.invokeOnCancellation {
-                    connectFuture.cancel(true)
-                    runCatching { (connectFuture as? ChannelFuture)?.channel()?.close() }
-                }
-                connectFuture.addListener { future ->
-                    if (!continuation.isActive) {
-                        (future as? ChannelFuture)?.channel()?.close()
-                        return@addListener
-                    }
-                    if (future.isSuccess) {
-                        val ch = (future as ChannelFuture).channel()
-                        log.channel.connected(ch.id(), ch.remoteAddress())
-                        continuation.resume(NettyConnection(ch, handler))
-                    } else {
-                        continuation.resumeWithException(future.cause())
-                    }
-                }
-            }
+            log.connecting("$host:$port")
+            connect(group, NioSocketChannel::class.java, java.net.InetSocketAddress(host, port), tcpOptions)
         }
 
     /**
      * Connects via a Unix domain socket at [path].
      *
-     * Requires `netty-transport-native-epoll` on Linux or
-     * `netty-transport-native-kqueue` on macOS to be on the runtime classpath.
-     * Throws [UnsupportedOperationException] if neither is available.
+     * Requires `netty-transport-native-epoll` on Linux or `netty-transport-native-kqueue`
+     * on macOS on the runtime classpath. Throws [UnsupportedOperationException] if neither
+     * is available.
      *
-     * [tcpOptions] fields that are TCP-specific (`noDelay`, `keepAlive`) do not apply
-     * to Unix domain sockets and are silently ignored.
+     * [tcpOptions] fields that are TCP-specific do not apply to Unix domain sockets
+     * and are silently ignored.
      */
-    fun connectUnix(path: String, tcpOptions: TcpOptions = TcpOptions()): One<NettyConnection> =
+    fun connectUnix(path: String, @Suppress("UNUSED_PARAMETER") tcpOptions: TcpOptions = TcpOptions()): One<NettyConnection> =
         One.defer(context = NettyDispatchers.io) {
-            log.channel.connecting(path, 0)
-            val group = nativeGroup
-                ?: throw UnsupportedOperationException(
-                    "Unix domain sockets require netty-transport-native-epoll (Linux) or " +
-                    "netty-transport-native-kqueue (macOS) on the classpath"
-                )
-            suspendCancellableCoroutine { continuation ->
-                val (channelClass, address) = resolveUnixChannel(path)
-                val handler    = InboundHandler()
-                val bootstrap  = Bootstrap()
-                    .group(group)
-                    .channel(channelClass)
-                    .handler(object : ChannelInitializer<Channel>() {
-                        override fun initChannel(ch: Channel) {
-                            ch.config().setAutoRead(false)
-                            ch.pipeline().addLast(handler)
-                        }
-                    })
-                val connectFuture = bootstrap.connect(address)
-                continuation.invokeOnCancellation {
-                    connectFuture.cancel(true)
-                    runCatching { (connectFuture as? ChannelFuture)?.channel()?.close() }
+            log.connecting(path)
+            val native = nativeGroupRef.get()
+                ?: run {
+                    val resolved = resolveNative()
+                        ?: throw UnsupportedOperationException(
+                            "Unix domain sockets require netty-transport-native-epoll (Linux) or " +
+                            "netty-transport-native-kqueue (macOS) on the classpath"
+                        )
+                    val group = MultiThreadIoEventLoopGroup(
+                        1, DefaultThreadFactory("netty-unix"), resolved.ioHandlerFactory
+                    )
+                    nativeGroupRef.compareAndSet(null, group)
+                    nativeGroupRef.get()!!
                 }
-                connectFuture.addListener { future ->
-                    if (!continuation.isActive) {
-                        (future as? ChannelFuture)?.channel()?.close()
-                        return@addListener
-                    }
-                    if (future.isSuccess) {
-                        val ch = (future as ChannelFuture).channel()
-                        log.channel.connected(ch.id(), ch.remoteAddress())
-                        continuation.resume(NettyConnection(ch, handler))
-                    } else {
-                        continuation.resumeWithException(future.cause())
-                    }
-                }
-            }
+            val resolved = resolveNative()!! // already validated above
+            connect(native, resolved.channelClass, resolved.addressFor(path), null)
         }
 
     /**
-     * Shuts down the event loop group(s) and waits for them to terminate.
+     * Shuts down the event loop group(s) and waits for termination.
      *
-     * Call this on application shutdown after all connections have been closed.
+     * Call this on application shutdown after all connections are closed.
      */
     fun close(): One<Unit> = One.defer(context = NettyDispatchers.io) {
         suspendCancellableCoroutine { continuation ->
-            val ng = nativeGroup
-            group.shutdownGracefully().addListener { future ->
+            val ng = nativeGroupRef.get()
+            group.shutdownGracefully().addListener { mainFuture ->
                 if (ng != null) {
-                    ng.shutdownGracefully().addListener { _ ->
-                        if (future.isSuccess) continuation.resume(Unit)
-                        else continuation.resumeWithException(future.cause())
+                    ng.shutdownGracefully().addListener { nativeFuture ->
+                        val cause = mainFuture.cause() ?: nativeFuture.cause()
+                        if (cause != null) continuation.resumeWithException(cause)
+                        else continuation.resume(Unit)
                     }
                 } else {
-                    if (future.isSuccess) continuation.resume(Unit)
-                    else continuation.resumeWithException(future.cause())
+                    if (mainFuture.isSuccess) continuation.resume(Unit)
+                    else continuation.resumeWithException(mainFuture.cause())
                 }
+            }
+        }
+    }
+
+    private suspend fun connect(
+        group:       MultiThreadIoEventLoopGroup,
+        channelType: Class<out Channel>,
+        address:     SocketAddress,
+        tcpOptions:  TcpOptions?,
+    ): NettyConnection = suspendCancellableCoroutine { continuation ->
+        val handler   = InboundHandler()
+        val bootstrap = Bootstrap().group(group).channel(channelType)
+            .apply {
+                if (tcpOptions != null) {
+                    option(ChannelOption.TCP_NODELAY, tcpOptions.noDelay)
+                    option(ChannelOption.SO_KEEPALIVE, tcpOptions.keepAlive)
+                }
+            }
+            .handler(object : ChannelInitializer<Channel>() {
+                override fun initChannel(ch: Channel) {
+                    ch.config().setAutoRead(false)
+                    ch.pipeline().addLast(handler)
+                }
+            })
+        val connectFuture = bootstrap.connect(address)
+        continuation.invokeOnCancellation {
+            connectFuture.cancel(true)
+            runCatching { (connectFuture as? ChannelFuture)?.channel()?.close() }
+        }
+        connectFuture.addListener { future ->
+            if (!continuation.isActive) {
+                (future as? ChannelFuture)?.channel()?.close()
+                return@addListener
+            }
+            if (future.isSuccess) {
+                val ch = (future as ChannelFuture).channel()
+                log.connected(ch.id(), ch.remoteAddress())
+                continuation.resume(NettyConnection(ch, handler))
+            } else {
+                continuation.resumeWithException(future.cause())
             }
         }
     }
 }
 
-/**
- * A connected Netty TCP or Unix socket channel with its [InboundHandler] pre-installed.
- */
+/** A connected TCP or Unix socket channel with its [InboundHandler] installed. */
 class NettyConnection(
-    val channel: Channel,
+    val channel:  Channel,
     internal val handler: InboundHandler,
 ) {
     internal val log = Logging.of<NettyConnection>()
@@ -197,18 +181,17 @@ class NettyConnection(
 /**
  * Bridges a Netty channel's inbound byte stream into an aelv [Many].
  *
- * Installed in the pipeline during [ChannelInitializer.initChannel] so it is present
- * for all lifecycle events. Only one subscriber is supported at a time.
- *
- * **Backpressure** propagates via `autoRead`: when downstream has demand, `autoRead=true`
- * lets Netty push data; when demand is exhausted, `autoRead=false` stops reads at the
- * TCP level.
+ * Backpressure: when downstream has demand, `autoRead=true` lets Netty push frames;
+ * when demand is exhausted, `autoRead=false` halts reads at the TCP level.
  *
  * **Buffer ownership**: the [ByteBuf] passed to `onNext` has refcnt=1. The subscriber
- * **must** call `buf.release()` after processing to avoid a Netty memory leak.
+ * must call `buf.release()` after processing.
  *
  * **Post-termination subscribe**: if [subscribe] is called after the channel has already
- * closed or errored, `onComplete` (or `onError`) is signalled immediately per RS §1.9.
+ * closed or errored, `onComplete`/`onError` is signalled immediately (RS §1.9).
+ *
+ * Only one subscriber is supported at a time. A second concurrent [subscribe] call is
+ * rejected with `onError(IllegalStateException)`.
  */
 class InboundHandler : ChannelInboundHandlerAdapter(), Publisher<ByteBuf> {
 
@@ -222,16 +205,24 @@ class InboundHandler : ChannelInboundHandlerAdapter(), Publisher<ByteBuf> {
     @Volatile private var terminalError: Throwable?             = null
 
     override fun subscribe(sub: Subscriber<in ByteBuf>) {
-        // RS §1.9: if already terminated, signal immediately
-        if (terminated.get()) {
-            sub.onSubscribe(NoopSubscription)
-            val err = terminalError
-            if (err != null) sub.onError(err) else sub.onComplete()
-            return
-        }
+        // Register before checking terminated so we never miss a terminal signal:
+        // if terminated is true when we check, we signal here; if it becomes true
+        // after our CAS, channelInactive/exceptionCaught will find our subscriber
+        // and signal it. The subscriberRef.CAS in the terminated path prevents
+        // double-signal when both paths race.
         if (!subscriberRef.compareAndSet(null, sub)) {
             sub.onSubscribe(NoopSubscription)
             sub.onError(IllegalStateException("InboundHandler only supports a single subscriber"))
+            return
+        }
+        if (terminated.get()) {
+            // Claim the subscriber atomically; if channelInactive raced here it
+            // already claimed it via getAndSet and signalled — our CAS will fail.
+            if (subscriberRef.compareAndSet(sub, null)) {
+                sub.onSubscribe(NoopSubscription)
+                val err = terminalError
+                if (err != null) sub.onError(err) else sub.onComplete()
+            }
             return
         }
         sub.onSubscribe(object : Subscription {
@@ -240,22 +231,18 @@ class InboundHandler : ChannelInboundHandlerAdapter(), Publisher<ByteBuf> {
                     sub.onError(IllegalArgumentException("request must be positive, got $n (RS §3.9)"))
                     return
                 }
-                log.inbound.demand(n)
-                // Cap at Long.MAX_VALUE to avoid overflow (RS §3.17)
+                log.demand(n)
                 val prev = demand.getAndUpdate { curr ->
                     if (n >= Long.MAX_VALUE - curr) Long.MAX_VALUE else curr + n
                 }
                 if (prev == 0L && !cancelled.get()) {
                     val c = ctx ?: return
-                    log.inbound.demandSignalled(c.channel().id())
-                    c.channel().eventLoop().execute {
-                        c.channel().config().setAutoRead(true)
-                    }
+                    log.demandSignalled(c.channel().id())
+                    c.channel().eventLoop().execute { c.channel().config().setAutoRead(true) }
                 }
             }
-
             override fun cancel() {
-                log.inbound.cancelled()
+                log.cancelled()
                 cancelled.set(true)
                 subscriberRef.set(null)
                 ctx?.let { c ->
@@ -265,47 +252,43 @@ class InboundHandler : ChannelInboundHandlerAdapter(), Publisher<ByteBuf> {
         })
     }
 
-    override fun handlerAdded(ctx: ChannelHandlerContext) {
-        this.ctx = ctx
-    }
+    override fun handlerAdded(ctx: ChannelHandlerContext) { this.ctx = ctx }
 
     override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
         val buf = msg as ByteBuf
         if (cancelled.get()) { buf.release(); return }
         val sub = subscriberRef.get() ?: run {
-            log.inbound.droppedNoSubscriber(ctx.channel().id(), buf.readableBytes())
+            log.dropped(ctx.channel().id(), buf.readableBytes())
             buf.release()
             return
         }
-        log.inbound.received(ctx.channel().id(), buf.readableBytes())
-        val remaining = demand.decrementAndGet()
+        log.received(ctx.channel().id(), buf.readableBytes())
+        val remaining = demand.updateAndGet { curr ->
+            if (curr == Long.MAX_VALUE) Long.MAX_VALUE else curr - 1
+        }
         if (remaining == 0L) {
-            log.inbound.demandExhausted(ctx.channel().id())
+            log.demandExhausted(ctx.channel().id())
             ctx.channel().config().setAutoRead(false)
         }
-        // Transfer ownership to subscriber (refcnt stays at 1; subscriber must release)
         sub.onNext(buf)
     }
 
     override fun channelRegistered(ctx: ChannelHandlerContext) {
-        log.channel.registered(ctx.channel().id())
-        super.channelRegistered(ctx)
+        log.registered(ctx.channel().id()); super.channelRegistered(ctx)
     }
-
     override fun channelActive(ctx: ChannelHandlerContext) {
-        log.channel.active(ctx.channel().id())
-        super.channelActive(ctx)
+        log.active(ctx.channel().id()); super.channelActive(ctx)
     }
 
     override fun channelInactive(ctx: ChannelHandlerContext) {
-        log.channel.inactive(ctx.channel().id())
+        log.inactive(ctx.channel().id())
         if (terminated.compareAndSet(false, true)) {
             subscriberRef.getAndSet(null)?.onComplete()
         }
     }
 
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
-        log.channel.error(ctx.channel().id(), cause)
+        log.error(ctx.channel().id(), cause)
         if (terminated.compareAndSet(false, true)) {
             terminalError = cause
             subscriberRef.getAndSet(null)?.onError(cause)
@@ -313,7 +296,6 @@ class InboundHandler : ChannelInboundHandlerAdapter(), Publisher<ByteBuf> {
     }
 }
 
-// Reused for post-termination subscriptions and rejected duplicate subscriptions.
 private object NoopSubscription : Subscription {
     override fun request(n: Long) = Unit
     override fun cancel()        = Unit
@@ -322,14 +304,15 @@ private object NoopSubscription : Subscription {
 private val rawByteReaderCounter = AtomicInteger(0)
 
 /**
- * Reads exactly one raw byte from the channel, bypassing the normal inbound stream.
+ * Reads exactly one raw byte from the channel, bypassing the inbound stream.
  *
- * Used for protocol-level handshakes that exchange a single raw byte before the
- * framing layer is active — e.g. PGwire's TLS negotiation response (`S` or `N`).
+ * Used for protocol handshakes that exchange a single byte before framing is
+ * active — e.g. PGwire's TLS negotiation response (`S` or `N`).
  *
- * Each call installs a uniquely-named one-shot handler at the head of the pipeline.
- * The handler is removed immediately after the byte is read, on exception, or on
- * coroutine cancellation — no state leaks to subsequent reads.
+ * If the inbound [ByteBuf] contains more than one byte (TCP coalescing), the
+ * remaining bytes are forwarded to the next handler before the one-shot handler
+ * is removed. Each call uses a unique handler name so sequential calls are safe.
+ * Handler removal on cancellation runs on the event loop to preserve ordering.
  */
 suspend fun NettyConnection.readRawByte(): Byte {
     val handlerName = "raw-byte-reader-${rawByteReaderCounter.incrementAndGet()}"
@@ -340,11 +323,13 @@ suspend fun NettyConnection.readRawByte(): Byte {
                 override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
                     if (msg is ByteBuf && msg.isReadable) {
                         val byte = msg.readByte()
+                        // Forward any remaining bytes to the next handler before removal
+                        if (msg.isReadable) ctx.fireChannelRead(msg.retainedSlice())
                         msg.release()
                         ctx.pipeline().remove(handlerName)
                         continuation.resume(byte)
                     } else {
-                        (msg as? ByteBuf)?.release()
+                        ctx.fireChannelRead(msg)
                     }
                 }
                 override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
@@ -360,90 +345,73 @@ suspend fun NettyConnection.readRawByte(): Byte {
     }
 }
 
+// -------------------------------------------------------------------------
+// Native transport detection
+// -------------------------------------------------------------------------
+
+private data class NativeTransport(
+    val ioHandlerFactory: IoHandlerFactory,
+    val channelClass:     Class<out Channel>,
+    val addressFor:       (String) -> SocketAddress,
+)
+
 /**
- * Resolves the platform-appropriate native [io.netty.channel.IoHandlerFactory] and creates
- * a new [MultiThreadIoEventLoopGroup] for Unix domain socket connections.
+ * Detects the platform-appropriate native transport (Epoll on Linux, KQueue on macOS)
+ * via reflection to avoid a hard compile-time dependency.
  *
- * Returns null if neither Epoll (Linux) nor KQueue (macOS) is available on the classpath.
+ * Returns null if neither native transport is available at runtime.
  */
-private fun resolveNativeGroup(threads: Int): MultiThreadIoEventLoopGroup? {
+private fun resolveNative(): NativeTransport? {
+    // Try Epoll (Linux)
     runCatching {
         val available = Class.forName("io.netty.channel.epoll.Epoll")
             .getMethod("isAvailable").invoke(null) as Boolean
         if (available) {
-            val factory = Class.forName("io.netty.channel.epoll.EpollIoHandler")
-                .getMethod("newFactory").invoke(null) as io.netty.channel.IoHandlerFactory
-            return MultiThreadIoEventLoopGroup(threads, DefaultThreadFactory("netty-unix"), factory)
+            val factory  = Class.forName("io.netty.channel.epoll.EpollIoHandler")
+                .getMethod("newFactory").invoke(null) as IoHandlerFactory
+            val channel  = Class.forName("io.netty.channel.epoll.EpollDomainSocketChannel")
+                .asSubclass(Channel::class.java)
+            val addrCtor = Class.forName("io.netty.channel.unix.DomainSocketAddress")
+                .getConstructor(String::class.java)
+            return NativeTransport(factory, channel) { addrCtor.newInstance(it) as SocketAddress }
         }
     }
+    // Try KQueue (macOS)
     runCatching {
         val available = Class.forName("io.netty.channel.kqueue.KQueue")
             .getMethod("isAvailable").invoke(null) as Boolean
         if (available) {
-            val factory = Class.forName("io.netty.channel.kqueue.KQueueIoHandler")
-                .getMethod("newFactory").invoke(null) as io.netty.channel.IoHandlerFactory
-            return MultiThreadIoEventLoopGroup(threads, DefaultThreadFactory("netty-unix"), factory)
+            val factory  = Class.forName("io.netty.channel.kqueue.KQueueIoHandler")
+                .getMethod("newFactory").invoke(null) as IoHandlerFactory
+            val channel  = Class.forName("io.netty.channel.kqueue.KQueueDomainSocketChannel")
+                .asSubclass(Channel::class.java)
+            val addrCtor = Class.forName("io.netty.channel.unix.DomainSocketAddress")
+                .getConstructor(String::class.java)
+            return NativeTransport(factory, channel) { addrCtor.newInstance(it) as SocketAddress }
         }
     }
     return null
 }
 
-/**
- * Resolves the platform-appropriate Unix domain socket channel class and connect address.
- *
- * Checks for Epoll (Linux) first, then KQueue (macOS).
- * Throws [UnsupportedOperationException] if neither native transport is available.
- */
-private fun resolveUnixChannel(path: String): Pair<Class<out Channel>, java.net.SocketAddress> {
-    runCatching {
-        val available = Class.forName("io.netty.channel.epoll.Epoll")
-            .getMethod("isAvailable").invoke(null) as Boolean
-        if (available) {
-            val channelClass = Class.forName("io.netty.channel.epoll.EpollDomainSocketChannel")
-                .asSubclass(Channel::class.java)
-            val address = Class.forName("io.netty.channel.unix.DomainSocketAddress")
-                .getConstructor(String::class.java).newInstance(path) as java.net.SocketAddress
-            return channelClass to address
-        }
-    }
-    runCatching {
-        val available = Class.forName("io.netty.channel.kqueue.KQueue")
-            .getMethod("isAvailable").invoke(null) as Boolean
-        if (available) {
-            val channelClass = Class.forName("io.netty.channel.kqueue.KQueueDomainSocketChannel")
-                .asSubclass(Channel::class.java)
-            val address = Class.forName("io.netty.channel.unix.DomainSocketAddress")
-                .getConstructor(String::class.java).newInstance(path) as java.net.SocketAddress
-            return channelClass to address
-        }
-    }
-    throw UnsupportedOperationException(
-        "Unix domain sockets require netty-transport-native-epoll (Linux) or " +
-        "netty-transport-native-kqueue (macOS) on the classpath"
-    )
-}
+// -------------------------------------------------------------------------
+// Public extension functions
+// -------------------------------------------------------------------------
 
-/** Returns the inbound byte stream of this connection as an aelv [Many]. */
+/** Returns the inbound byte stream as an aelv [Many]. */
 fun NettyConnection.inbound(): Many<ByteBuf> = Many.from(handler)
 
 /**
- * Writes [buf] to the channel and flushes, suspending until Netty confirms the write.
+ * Writes [buf] to the channel and flushes, suspending until Netty confirms completion.
  *
- * Runs on [NettyDispatchers.io] to avoid blocking the caller's dispatcher.
- * The caller retains ownership of [buf] — release it after this call returns if
- * the underlying [io.netty.buffer.ByteBuf] is reference-counted.
+ * Runs on [NettyDispatchers.io]. The caller retains ownership of [buf] — release after
+ * this call if the buffer is reference-counted.
  */
 fun NettyConnection.write(buf: ByteBuf): None<ByteBuf> = None.defer(context = NettyDispatchers.io) {
-    log.outbound.write(channel.id(), buf.readableBytes())
+    log.write(channel.id(), buf.readableBytes())
     suspendCancellableCoroutine { continuation ->
         channel.writeAndFlush(buf).addListener { future ->
-            if (future.isSuccess) {
-                log.outbound.writeComplete(channel.id())
-                continuation.resume(Unit)
-            } else {
-                log.outbound.writeFailed(channel.id(), future.cause())
-                continuation.resumeWithException(future.cause())
-            }
+            if (future.isSuccess) { log.writeComplete(channel.id()); continuation.resume(Unit) }
+            else { log.writeFailed(channel.id(), future.cause()); continuation.resumeWithException(future.cause()) }
         }
     }
 }

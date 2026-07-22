@@ -20,7 +20,9 @@ dependencies {
     api(libs.bundles.api)
     implementation(libs.bundles.core)
     compileOnly("io.netty:netty-transport-native-epoll:${libs.versions.netty.get()}:linux-x86_64")
+    compileOnly("io.netty:netty-transport-native-epoll:${libs.versions.netty.get()}:linux-aarch_64")
     compileOnly("io.netty:netty-transport-native-kqueue:${libs.versions.netty.get()}:osx-x86_64")
+    compileOnly("io.netty:netty-transport-native-kqueue:${libs.versions.netty.get()}:osx-aarch_64")
     testImplementation(libs.bundles.test)
     jmh(libs.jmh.annprocess)
 }

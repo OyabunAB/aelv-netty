@@ -32,48 +32,45 @@ import kotlin.coroutines.resumeWithException
 /**
  * Controls whether and how TLS is established for a TCP connection.
  *
- * [Disable] sends no [SSLRequest] and connects plain.
+ * [Disable] — no TLS.
  *
- * [Prefer] attempts TLS if the server supports it, falls back to plain if the server
- * declines. Use when the server may or may not have TLS enabled.
+ * [Prefer] — TLS if the server supports it, plain otherwise. The caller handles the
+ * negotiation byte exchange and calls [upgradeTls] only if the server accepts.
  *
- * [Require] requires TLS — throws if the server declines. Does not verify the server
- * certificate. Protects against passive eavesdropping but not active MITM.
+ * [Require] — TLS required; throws if the server declines. Does not verify the
+ * certificate. Protects against passive eavesdropping, not active MITM.
  *
- * [Verify] requires TLS and verifies the server certificate against [trustStorePath].
- * A null [trustStorePath] uses the JVM's default trust store (works for publicly-trusted CAs).
+ * [Verify] — TLS + certificate verification against [trustStorePath]. A null
+ * [trustStorePath] uses the JVM default trust store. [trustStorePassword] is required
+ * for password-protected JKS and PKCS12 stores; null for unprotected or PEM.
  *
- * [VerifyFull] requires TLS, verifies the server certificate, and additionally checks
- * that the server hostname matches the certificate's CN or SAN. Strongest protection.
- * A null [trustStorePath] uses the JVM's default trust store.
+ * [VerifyFull] — TLS + certificate + hostname verification (RFC 2818 algorithm).
+ * Strongest protection. [trustStorePath] and [trustStorePassword] same as [Verify].
  */
 sealed interface SslMode {
     data object Disable    : SslMode
     data object Prefer     : SslMode
     data object Require    : SslMode
-    data class  Verify  (val trustStorePath: String? = null) : SslMode
-    data class  VerifyFull(val trustStorePath: String? = null) : SslMode
+    data class  Verify    (val trustStorePath: String? = null, val trustStorePassword: String? = null) : SslMode
+    data class  VerifyFull(val trustStorePath: String? = null, val trustStorePassword: String? = null) : SslMode
 }
 
 /**
- * Upgrades this plain TCP connection to TLS using Netty's [io.netty.handler.ssl.SslHandler].
+ * Upgrades this plain TCP connection to TLS.
  *
- * Inserts the [io.netty.handler.ssl.SslHandler] at the head of the pipeline and suspends
- * until the TLS handshake completes. The caller is responsible for any protocol-level
- * TLS negotiation (e.g. PGwire SSLRequest/S) before calling this.
+ * Inserts an [SslHandler] at the head of the pipeline and suspends until the TLS
+ * handshake completes. The caller is responsible for any protocol-level negotiation
+ * (e.g. PGwire SSLRequest/S) before calling this.
  *
- * [mode] must not be [SslMode.Disable] or [SslMode.Prefer] — those are handled by the
- * caller before deciding whether to call this function.
- *
- * [serverHostname] is used for SNI and, when [mode] is [SslMode.VerifyFull],
- * for hostname verification against the server certificate.
+ * [mode] must be [SslMode.Require], [SslMode.Verify], or [SslMode.VerifyFull].
+ * [SslMode.Disable] and [SslMode.Prefer] are handled by the caller before deciding
+ * whether to call this function.
  */
 suspend fun NettyConnection.upgradeTls(mode: SslMode, serverHostname: String) {
-    val sslContext = buildSslContext(mode, serverHostname)
+    val sslContext = buildSslContext(mode)
     val port       = (channel.remoteAddress() as? java.net.InetSocketAddress)?.port ?: -1
     val sslEngine  = sslContext.newEngine(channel.alloc(), serverHostname, port)
-
-    val sslHandler = io.netty.handler.ssl.SslHandler(sslEngine)
+    val sslHandler = SslHandler(sslEngine)
 
     suspendCancellableCoroutine<Unit> { continuation ->
         channel.pipeline().addFirst("ssl", sslHandler)
@@ -83,46 +80,55 @@ suspend fun NettyConnection.upgradeTls(mode: SslMode, serverHostname: String) {
                 future.cause() ?: RuntimeException("TLS handshake failed")
             )
         }
-        continuation.invokeOnCancellation { sslHandler.close() }
+        continuation.invokeOnCancellation {
+            channel.eventLoop().execute { sslHandler.close() }
+        }
     }
 }
 
-private fun buildSslContext(mode: SslMode, hostname: String): SslContext = when (mode) {
-    is SslMode.Disable    -> error("buildSslContext called with SslMode.Disable")
-    is SslMode.Prefer,
+private fun buildSslContext(mode: SslMode): SslContext = when (mode) {
+    is SslMode.Disable,
+    is SslMode.Prefer     -> error("buildSslContext must not be called with ${mode::class.simpleName}")
     is SslMode.Require    -> SslContextBuilder.forClient()
         .trustManager(InsecureTrustManagerFactory.INSTANCE)
         .build()
-    is SslMode.Verify   -> SslContextBuilder.forClient()
-        .trustManager(loadTrustManagerFactory(mode.trustStorePath))
+    is SslMode.Verify     -> SslContextBuilder.forClient()
+        .trustManager(loadTrustManagerFactory(mode.trustStorePath, mode.trustStorePassword))
         .build()
     is SslMode.VerifyFull -> SslContextBuilder.forClient()
-        .trustManager(loadTrustManagerFactory(mode.trustStorePath))
+        .trustManager(loadTrustManagerFactory(mode.trustStorePath, mode.trustStorePassword))
         .endpointIdentificationAlgorithm("HTTPS")
         .build()
 }
 
-private fun loadTrustManagerFactory(trustStorePath: String?): TrustManagerFactory {
-    if (trustStorePath == null) {
+private fun loadTrustManagerFactory(path: String?, password: String?): TrustManagerFactory {
+    val passwordChars = password?.toCharArray()
+    if (path == null) {
         return TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
             .also { it.init(null as KeyStore?) }
     }
-    val file = File(trustStorePath)
-    val keyStore = when {
-        trustStorePath.endsWith(".jks") || trustStorePath.endsWith(".p12") -> {
-            val ks = KeyStore.getInstance(if (trustStorePath.endsWith(".p12")) "PKCS12" else "JKS")
-            FileInputStream(file).use { ks.load(it, null) }
-            ks
+    val file    = File(path)
+    val keyStore: KeyStore = when {
+        path.endsWith(".jks") -> {
+            KeyStore.getInstance("JKS").also { ks ->
+                FileInputStream(file).use { ks.load(it, passwordChars) }
+            }
+        }
+        path.endsWith(".p12") || path.endsWith(".pfx") -> {
+            KeyStore.getInstance("PKCS12").also { ks ->
+                FileInputStream(file).use { ks.load(it, passwordChars) }
+            }
         }
         else -> {
+            // PEM — load as X.509 certificate entry
+            val cert = FileInputStream(file).use { stream ->
+                java.security.cert.CertificateFactory.getInstance("X.509")
+                    .generateCertificate(stream)
+            }
             return TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
                 .also { tmf ->
-                    val ks   = KeyStore.getInstance(KeyStore.getDefaultType())
+                    val ks = KeyStore.getInstance(KeyStore.getDefaultType())
                     ks.load(null)
-                    val cert = FileInputStream(file).use { stream ->
-                        java.security.cert.CertificateFactory.getInstance("X.509")
-                            .generateCertificate(stream)
-                    }
                     ks.setCertificateEntry("ca", cert)
                     tmf.init(ks)
                 }
@@ -133,35 +139,31 @@ private fun loadTrustManagerFactory(trustStorePath: String?): TrustManagerFactor
 }
 
 /**
- * The channel binding data established during a TLS handshake.
+ * The channel binding established during a TLS handshake, used by SCRAM-SHA-256-PLUS.
  *
- * [None] — no TLS was negotiated; channel binding is unavailable.
- * [TlsServerEndPoint] — TLS is active; [data] is `SHA-256(server_leaf_certificate_DER)`
- * as defined by RFC 5929 §4, used by SCRAM-SHA-256-PLUS.
+ * [None] — no TLS active.
+ * [TlsServerEndPoint] — TLS active; [digest] is `SHA-256(server_leaf_certificate_DER)`
+ * per RFC 5929 §4.
  */
 sealed interface ChannelBinding {
-    data object None                                          : ChannelBinding
-    data class  TlsServerEndPoint(val digest: ByteArray)     : ChannelBinding
+    data object None                                      : ChannelBinding
+    data class  TlsServerEndPoint(val digest: ByteArray)  : ChannelBinding
 }
 
-/** Returns the [SslHandler] installed in this connection's pipeline, or null if TLS is not active. */
+/** Returns the [SslHandler] installed in this connection's pipeline, or null. */
 fun NettyConnection.sslHandler(): SslHandler? =
     channel.pipeline().get(SslHandler::class.java)
 
 /**
  * Computes the [ChannelBinding] for this connection.
  *
- * Returns [ChannelBinding.TlsServerEndPoint] with `SHA-256(server_leaf_certificate_DER)`
- * when TLS is active, or [ChannelBinding.None] if TLS was not negotiated or no peer
- * certificate is available.
+ * Returns [ChannelBinding.TlsServerEndPoint] with `SHA-256(server_leaf_cert_DER)` when
+ * TLS is active, or [ChannelBinding.None] if TLS was not negotiated.
  */
 fun NettyConnection.channelBinding(): ChannelBinding {
     val cert = sslHandler()
-        ?.engine()
-        ?.session
-        ?.peerCertificates
-        ?.takeIf { it.isNotEmpty() }
-        ?.get(0) as? X509Certificate
+        ?.engine()?.session?.peerCertificates
+        ?.takeIf { it.isNotEmpty() }?.get(0) as? X509Certificate
         ?: return ChannelBinding.None
     return ChannelBinding.TlsServerEndPoint(
         MessageDigest.getInstance("SHA-256").digest(cert.encoded)

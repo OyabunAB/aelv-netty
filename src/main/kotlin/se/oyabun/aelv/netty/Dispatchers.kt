@@ -16,40 +16,32 @@
 package se.oyabun.aelv.netty
 
 import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asCoroutineDispatcher
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Coroutine dispatchers used internally by aelv-netty.
  *
- * Using named thread pools makes coroutine activity visible and identifiable
- * in thread dumps, profilers, and distributed traces.
+ * Thread pools are created on first access, not at class-load time.
+ * Both pools use daemon threads so they do not prevent JVM exit.
  */
 object NettyDispatchers {
 
     /**
-     * Dispatcher for Netty I/O operations — connect, write, close.
+     * Dispatcher for Netty I/O bridge operations — connect, write, close.
      *
-     * Sized to the number of available processors. All Netty future callbacks
-     * resume on this dispatcher so they never block the caller's thread.
+     * Sized to at least 4 threads so concurrent connection pool operations
+     * (multiple simultaneous connects or writes) don't serialise behind a
+     * two-thread bottleneck. Actual I/O runs on Netty's own event loop threads.
      */
-    val io: CoroutineDispatcher = Executors.newFixedThreadPool(
-        Runtime.getRuntime().availableProcessors(),
-    ) { runnable ->
-        Thread(runnable, "aelv-netty-io-${threadCounter.incrementAndGet()}")
-            .also { it.isDaemon = true }
-    }.asCoroutineDispatcher()
+    val io: CoroutineDispatcher by lazy {
+        val threads = Runtime.getRuntime().availableProcessors().coerceAtLeast(4)
+        Executors.newFixedThreadPool(threads) { runnable ->
+            Thread(runnable, "aelv-netty-io-${counter.incrementAndGet()}")
+                .also { it.isDaemon = true }
+        }.asCoroutineDispatcher()
+    }
 
-    /**
-     * Dispatcher for inbound message processing — framing, decoding, routing.
-     *
-     * Single-threaded to preserve message ordering within a connection.
-     */
-    val inbound: CoroutineDispatcher = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "aelv-netty-inbound")
-            .also { it.isDaemon = true }
-    }.asCoroutineDispatcher()
-
-    private val threadCounter = java.util.concurrent.atomic.AtomicInteger(0)
+    private val counter = AtomicInteger(0)
 }

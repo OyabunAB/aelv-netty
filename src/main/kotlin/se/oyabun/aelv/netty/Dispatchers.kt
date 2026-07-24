@@ -15,33 +15,10 @@
  */
 package se.oyabun.aelv.netty
 
-import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.asCoroutineDispatcher
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
-
 /**
- * Coroutine dispatchers used internally by aelv-netty.
+ * Coroutine dispatchers for aelv-netty.
  *
- * Thread pools are created on first access, not at class-load time.
- * Both pools use daemon threads so they do not prevent JVM exit.
+ * The I/O bridge dispatcher is owned per-[NettyTransport] instance and is shut down
+ * when [NettyTransport.close] is called. There is no longer a shared global dispatcher.
  */
-object NettyDispatchers {
-
-    /**
-     * Dispatcher for Netty I/O bridge operations — connect, write, close.
-     *
-     * Sized to at least 4 threads so concurrent connection pool operations
-     * (multiple simultaneous connects or writes) don't serialise behind a
-     * two-thread bottleneck. Actual I/O runs on Netty's own event loop threads.
-     */
-    val io: CoroutineDispatcher by lazy {
-        val threads = Runtime.getRuntime().availableProcessors().coerceAtLeast(4)
-        Executors.newFixedThreadPool(threads) { runnable ->
-            Thread(runnable, "aelv-netty-io-${counter.incrementAndGet()}")
-                .also { it.isDaemon = true }
-        }.asCoroutineDispatcher()
-    }
-
-    private val counter = AtomicInteger(0)
-}
+object NettyDispatchers

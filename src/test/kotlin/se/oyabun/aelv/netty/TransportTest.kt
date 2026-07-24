@@ -28,12 +28,17 @@ import io.netty.channel.socket.nio.NioServerSocketChannel
 import io.netty.handler.ssl.SslContextBuilder
 import io.netty.handler.ssl.util.SelfSignedCertificate
 import io.netty.util.concurrent.DefaultThreadFactory
-
+import kotlinx.coroutines.delay
+import org.reactivestreams.Subscriber
+import org.reactivestreams.Subscription
 import se.oyabun.aelv.Many
 import se.oyabun.aelv.None
+import se.oyabun.aelv.Observable
 import se.oyabun.aelv.One
 import se.oyabun.aelv.Sinks
 import se.oyabun.aelv.Verify
+import se.oyabun.aelv.andThen
+import se.oyabun.aelv.await
 import se.oyabun.aelv.concatWith
 import se.oyabun.aelv.map
 import se.oyabun.aelv.mergeWith
@@ -48,6 +53,7 @@ import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 class TransportTest {
@@ -56,28 +62,22 @@ class TransportTest {
         val port get() = socket.localPort
     }
 
-    private fun <T : Any> withServer(
+    @Suppress("UNCHECKED_CAST")
+    private fun <T : Any, X : Observable<T, *>> withServer(
         behavior: (Socket) -> Unit = { it.getInputStream().read() },
-        use: (Int) -> Many<T>,
-    ): Many<T> = Many.resource(
-        acquire = { One.single(ServerSocket(0).let { s ->
-            TestServer(s, Thread { runCatching { behavior(s.accept()) } }.also { it.start() })
-        })},
-        release = { s, _ -> None.defer<Unit> { s.socket.close(); s.thread.join(2000) } },
-        use     = { s -> use(s.port) },
-    )
+        use: (Int) -> X,
+    ): X {
+        val server = ServerSocket(0)
+        val thread = Thread { runCatching { behavior(server.accept()) } }.also { it.start() }
+        return use(server.localPort).doFinally { server.close(); thread.join(2000) } as X
+    }
 
-    private fun <T : Any> withTransport(use: (NettyTransport) -> Many<T>): Many<T> = Many.resource(
-        acquire = { One.single(NettyTransport()) },
-        release = { t, _ -> t.close().discard() },
-        use     = use,
-    )
+    @Suppress("UNCHECKED_CAST")
+    private fun <T : Any, X : Observable<T, *>> withTransport(use: (NettyTransport) -> X): X {
+        val transport = NettyTransport()
+        return use(transport).doFinally { transport.close().await() } as X
+    }
 
-    private fun <T : Any> withConnection(transport: NettyTransport, port: Int, use: (NettyConnection) -> Many<T>): Many<T> = Many.resource(
-        acquire = { transport.connect("localhost", port) },
-        release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
-        use     = use,
-    )
 
     private fun sending(vararg bytes: Byte): (Socket) -> Unit = { s ->
         s.getOutputStream().write(byteArrayOf(*bytes)); s.getOutputStream().flush(); s.close()
@@ -95,53 +95,62 @@ class TransportTest {
         val group:   MultiThreadIoEventLoopGroup,
     )
 
-    private fun <T : Any> withTlsServer(use: (port: Int, cert: SelfSignedCertificate) -> Many<T>): Many<T> = Many.resource(
-        acquire = {
-            val cert      = SelfSignedCertificate()
-            val serverCtx = SslContextBuilder.forServer(cert.certificate(), cert.privateKey()).build()
-            val group     = MultiThreadIoEventLoopGroup(1, DefaultThreadFactory("test-tls"), NioIoHandler.newFactory())
-            val channel   = ServerBootstrap()
-                .group(group)
-                .channel(NioServerSocketChannel::class.java)
-                .childHandler(object : ChannelInitializer<SocketChannel>() {
-                    override fun initChannel(ch: SocketChannel) {
-                        ch.pipeline().addLast(serverCtx.newHandler(ch.alloc()))
-                        ch.pipeline().addLast(object : ChannelInboundHandlerAdapter() {
-                            override fun channelRead(ctx: ChannelHandlerContext, msg: Any) { (msg as? ByteBuf)?.release() }
-                        })
-                    }
-                })
-                .bind(0).sync().channel()
-            One.single(TlsServer((channel.localAddress() as InetSocketAddress).port, cert, channel, group))
-        },
-        release = { s, _ -> None.defer<Unit> { s.channel.close().sync(); s.group.shutdownGracefully().sync(); s.cert.delete() } },
-        use     = { s -> use(s.port, s.cert) },
-    )
+    @Suppress("UNCHECKED_CAST")
+    private fun <T : Any, X : Observable<T, *>> withTlsServer(use: (Int, SelfSignedCertificate) -> X): X {
+        val server = tlsServerAcquire()
+        return use(server.port, server.cert).doFinally {
+            server.channel.close().sync(); server.group.shutdownGracefully().sync(); server.cert.delete()
+        } as X
+    }
+
+    private fun tlsServerAcquire(): TlsServer {
+        val cert      = SelfSignedCertificate()
+        val serverCtx = SslContextBuilder.forServer(cert.certificate(), cert.privateKey()).build()
+        val group     = MultiThreadIoEventLoopGroup(1, DefaultThreadFactory("test-tls"), NioIoHandler.newFactory())
+        val channel   = ServerBootstrap()
+            .group(group)
+            .channel(NioServerSocketChannel::class.java)
+            .childHandler(object : ChannelInitializer<SocketChannel>() {
+                override fun initChannel(ch: SocketChannel) {
+                    ch.pipeline().addLast(serverCtx.newHandler(ch.alloc()))
+                    ch.pipeline().addLast(object : ChannelInboundHandlerAdapter() {
+                        override fun channelRead(ctx: ChannelHandlerContext, msg: Any) { (msg as? ByteBuf)?.release() }
+                    })
+                }
+            })
+            .bind(0).sync().channel()
+        return TlsServer((channel.localAddress() as InetSocketAddress).port, cert, channel, group)
+    }
+
 
 
     @Test fun `connects to server`() = Verify.that(
         withServer { port ->
             withTransport { t ->
-                withConnection(t, port) { Many.empty<Unit>() }
+                None.resource(
+                    acquire = { t.connect("localhost", port) },
+                    release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                    use     = { None.complete<Unit>() },
+                )
             }
         }
     ).completes(within = 5.seconds)
 
     @Test fun `connect to refused port returns error`() = Verify.that(
-        withTransport { t -> t.connect("localhost", 1).toMany() }
+        withTransport { t -> t.connect("localhost", 1) }
     ).failsWith<Exception>(within = 5.seconds)
 
     @Test fun `write sends bytes to server`() = Sinks.unicast<ByteArray>().let { received ->
         Verify.that(
-            withServer(behavior = { s ->
-                val buf = ByteArray(64); received.emit(buf.copyOf(s.getInputStream().read(buf))); received.complete(); s.close()
+            withServer(behavior = { socket: Socket ->
+                val buf = ByteArray(64); received.emit(buf.copyOf(socket.getInputStream().read(buf))); received.complete(); socket.close()
             }) { port ->
                 withTransport { t ->
-                    withConnection(t, port) { conn ->
-                        None.defer<ByteArray> { conn.write(Unpooled.wrappedBuffer(byteArrayOf(1, 2, 3))).await() }
-                            .toMany()
-                            .concatWith(received.asMany())
-                    }
+                    One.resource(
+                        acquire = { t.connect("localhost", port) },
+                        release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                        use     = { conn -> conn.write(Unpooled.wrappedBuffer(byteArrayOf(1, 2, 3))).andThen { received.asOne() } },
+                    )
                 }
             }
         ).assertNext { assertEquals(listOf<Byte>(1, 2, 3), it.toList()) }.completes(within = 5.seconds)
@@ -150,49 +159,88 @@ class TransportTest {
     @Test fun `inbound delivers bytes from server`() = Verify.that(
         withServer(sending(7, 8, 9)) { port ->
             withTransport { t ->
-                withConnection(t, port) { conn ->
-                    conn.inbound()
-                        .map { buf: ByteBuf -> ByteArray(buf.readableBytes()).also { buf.readBytes(it) }.also { buf.release() } }
-                        .take(1L)
-                }
+                Many.resource(
+                    acquire = { t.connect("localhost", port) },
+                    release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                    use     = { conn ->
+                        conn.inbound()
+                            .map { buf: ByteBuf -> ByteArray(buf.readableBytes()).also { buf.readBytes(it) }.also { buf.release() } }
+                            .take(1L)
+                    },
+                )
             }
         }
     ).assertNext { assertTrue(it.contentEquals(byteArrayOf(7, 8, 9))) }.completes(within = 5.seconds)
 
     @Test fun `inbound completes when server closes`() = Verify.that(
-        withServer(behavior = { it.close() }) { port ->
+        withServer(behavior = { socket: Socket -> socket.close() }) { port ->
             withTransport { t ->
-                withConnection(t, port) { conn -> conn.inbound() }
+                Many.resource(
+                    acquire = { t.connect("localhost", port) },
+                    release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                    use     = { conn -> conn.inbound() },
+                )
             }
         }
     ).completes(within = 5.seconds)
 
-    @Test fun `inbound backpressure limits delivery to demanded items`() = Verify.that(
-        withServer(chunked(listOf(byteArrayOf(1), byteArrayOf(2), byteArrayOf(3)))) { port ->
-            withTransport { t ->
-                withConnection(t, port) { conn ->
-                    conn.inbound().take(1L).doOnNext { buf: ByteBuf -> buf.release() }
+    @Test fun `inbound backpressure limits delivery to demanded items`() {
+        val items = Sinks.unicast<Byte>()
+        Verify.that(
+            withServer(chunked(listOf(byteArrayOf(1), byteArrayOf(2), byteArrayOf(3)), delayMs = 50)) { port ->
+                withTransport { t ->
+                    None.resource(
+                        acquire = { t.connect("localhost", port) },
+                        release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                        use     = { conn ->
+                            // request(1) — after first item autoRead must be disabled
+                            conn.inbound().subscribe(object : Subscriber<ByteBuf> {
+                                override fun onSubscribe(s: Subscription) { s.request(1) }
+                                override fun onNext(buf: ByteBuf) { items.emit(buf.readByte().also { buf.release() }) }
+                                override fun onError(t: Throwable) = Unit
+                                override fun onComplete() = Unit
+                            })
+                            // wait 200ms — server would push 2nd and 3rd chunks if backpressure is broken
+                            None.defer<Byte> { delay(200.milliseconds); items.complete() }
+                        },
+                    ).andThen { items.asMany() }
                 }
             }
-        }
-    ).emitsCount(1).completes(within = 5.seconds)
+        ).emitsCount(1).completes(within = 5.seconds)
+    }
 
-    @Test fun `inbound backpressure — request(Long MAX_VALUE) does not overflow`() = Verify.that(
-        withServer(sending(42)) { port ->
-            withTransport { t ->
-                withConnection(t, port) { conn ->
-                    conn.inbound().doOnNext { buf: ByteBuf -> buf.release() }
+    @Test fun `inbound backpressure — request(Long MAX_VALUE) does not overflow`() {
+        val received = Sinks.unicast<Byte>()
+        Verify.that(
+            withServer(sending(42)) { port ->
+                withTransport { t ->
+                    One.resource(
+                        acquire = { t.connect("localhost", port) },
+                        release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                        use     = { conn ->
+                            // two MAX_VALUE requests — demand guard must prevent overflow
+                            conn.inbound().subscribe(object : Subscriber<ByteBuf> {
+                                override fun onSubscribe(s: Subscription) { s.request(Long.MAX_VALUE); s.request(Long.MAX_VALUE) }
+                                override fun onNext(buf: ByteBuf) { received.emit(buf.readByte().also { buf.release() }); received.complete() }
+                                override fun onError(t: Throwable) = Unit
+                                override fun onComplete() = Unit
+                            })
+                            None.defer<Byte> { }.andThen { received.asOne() }
+                        },
+                    )
                 }
             }
-        }
-    ).completes(within = 5.seconds)
+        ).assertNext { assertEquals(42.toByte(), it) }.completes(within = 5.seconds)
+    }
 
     @Test fun `subscribe after channel close signals onComplete immediately`() = Verify.that(
-        withServer(behavior = { it.close() }) { port ->
+        withServer(behavior = { socket: Socket -> socket.close() }) { port ->
             withTransport { t ->
-                withConnection(t, port) { conn ->
-                    conn.inbound().discard().toMany().concatWith(conn.inbound())
-                }
+                Many.resource(
+                    acquire = { t.connect("localhost", port) },
+                    release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                    use     = { conn -> conn.inbound().concatWith(conn.inbound()) },
+                )
             }
         }
     ).completes(within = 5.seconds)
@@ -200,9 +248,11 @@ class TransportTest {
     @Test fun `duplicate subscribe is rejected with error`() = Verify.that(
         withServer { port ->
             withTransport { t ->
-                withConnection(t, port) { conn ->
-                    conn.inbound().mergeWith(conn.inbound())
-                }
+                Many.resource(
+                    acquire = { t.connect("localhost", port) },
+                    release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                    use     = { conn -> conn.inbound().mergeWith(conn.inbound()) },
+                )
             }
         }
     ).failsWith<IllegalStateException>(within = 5.seconds)
@@ -211,11 +261,14 @@ class TransportTest {
         Verify.that(
             withServer(sending(0x53)) { port ->
                 withTransport { t ->
-                    withConnection(t, port) { conn ->
-                        None.defer<Byte> { result.emit(conn.readRawByte()); result.complete() }
-                            .toMany()
-                            .concatWith(result.asMany())
-                    }
+                    One.resource(
+                        acquire = { t.connect("localhost", port) },
+                        release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                        use     = { conn ->
+                            None.defer<Byte> { result.emit(conn.readRawByte()); result.complete() }
+                                .andThen { result.asOne() }
+                        },
+                    )
                 }
             }
         ).assertNext { assertEquals(0x53.toByte(), it) }.completes(within = 5.seconds)
@@ -225,12 +278,16 @@ class TransportTest {
         Verify.that(
             withServer(chunked(listOf(byteArrayOf(1), byteArrayOf(2), byteArrayOf(3)), delayMs = 20)) { port ->
                 withTransport { t ->
-                    withConnection(t, port) { conn ->
-                        None.defer<List<Byte>> {
-                            result.emit(listOf(conn.readRawByte(), conn.readRawByte(), conn.readRawByte()))
-                            result.complete()
-                        }.toMany().concatWith(result.asMany())
-                    }
+                    One.resource(
+                        acquire = { t.connect("localhost", port) },
+                        release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                        use     = { conn ->
+                            None.defer<List<Byte>> {
+                                result.emit(listOf(conn.readRawByte(), conn.readRawByte(), conn.readRawByte()))
+                                result.complete()
+                            }.andThen { result.asOne() }
+                        },
+                    )
                 }
             }
         ).assertNext { assertEquals(listOf(1.toByte(), 2.toByte(), 3.toByte()), it) }.completes(within = 5.seconds)
@@ -240,12 +297,16 @@ class TransportTest {
         Verify.that(
             withTlsServer { port, _ ->
                 withTransport { t ->
-                    withConnection(t, port) { conn ->
-                        None.defer<Boolean> {
-                            conn.upgradeTls(SslMode.Require, "localhost")
-                            result.emit(conn.sslHandler() != null); result.complete()
-                        }.toMany().concatWith(result.asMany())
-                    }
+                    One.resource(
+                        acquire = { t.connect("localhost", port) },
+                        release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                        use     = { conn ->
+                            None.defer<Boolean> {
+                                conn.upgradeTls(SslMode.Require, "localhost")
+                                result.emit(conn.sslHandler() != null); result.complete()
+                            }.andThen { result.asOne() }
+                        },
+                    )
                 }
             }
         ).assertNext { assertTrue(it) }.completes(within = 10.seconds)
@@ -255,12 +316,16 @@ class TransportTest {
         Verify.that(
             withTlsServer { port, _ ->
                 withTransport { t ->
-                    withConnection(t, port) { conn ->
-                        None.defer<ChannelBinding> {
-                            conn.upgradeTls(SslMode.Require, "localhost")
-                            result.emit(conn.channelBinding()); result.complete()
-                        }.toMany().concatWith(result.asMany())
-                    }
+                    One.resource(
+                        acquire = { t.connect("localhost", port) },
+                        release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                        use     = { conn ->
+                            None.defer<ChannelBinding> {
+                                conn.upgradeTls(SslMode.Require, "localhost")
+                                result.emit(conn.channelBinding()); result.complete()
+                            }.andThen { result.asOne() }
+                        },
+                    )
                 }
             }
         ).assertNext { binding ->
@@ -270,11 +335,13 @@ class TransportTest {
     }
 
     @Test fun `channelBinding returns None without TLS`() = Verify.that(
-        withServer(behavior = { it.close() }) { port ->
+        withServer(behavior = { socket: Socket -> socket.close() }) { port ->
             withTransport { t ->
-                withConnection(t, port) { conn ->
-                    Many.items(conn.channelBinding() to conn.sslHandler())
-                }
+                Many.resource(
+                    acquire = { t.connect("localhost", port) },
+                    release = { conn, _ -> None.defer<Unit> { conn.channel.close().sync() } },
+                    use     = { conn -> Many.items(conn.channelBinding() to conn.sslHandler()) },
+                )
             }
         }
     ).assertNext { (binding, ssl) ->

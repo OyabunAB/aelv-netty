@@ -37,18 +37,27 @@ import se.oyabun.aelv.None
 import se.oyabun.aelv.One
 import java.net.SocketAddress
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
+import kotlinx.coroutines.asCoroutineDispatcher
+
+private val transportCounter = AtomicInteger(0)
 
 /**
  * Lightweight Netty TCP transport.
  *
- * Owns a NIO [MultiThreadIoEventLoopGroup] for TCP connections. If [connectUnix] is
- * called, a native group (Epoll on Linux, KQueue on macOS) is created on first use and
- * reused for all subsequent Unix connections. Both groups are shut down by [close].
+ * Owns a NIO [MultiThreadIoEventLoopGroup] for TCP connections and a coroutine
+ * dispatcher for bridge operations (connect, write, close). If [connectUnix] is
+ * called, a native group (Epoll on Linux, KQueue on macOS) is created on first use.
+ *
+ * All owned resources — both Netty event loop groups and the coroutine dispatcher
+ * — are released by [close]. Call it on application shutdown after all connections
+ * are closed.
  *
  * [eventLoopThreads] defaults to 1. For database driver use cases one event loop
  * thread is sufficient — pipelining and coroutine concurrency live above this layer.
@@ -57,12 +66,21 @@ class NettyTransport(eventLoopThreads: Int = 1) {
 
     private val log = Logging.of<NettyTransport>()
 
+    private val id = transportCounter.incrementAndGet()
+
+    /** Coroutine dispatcher for Netty bridge operations. Shut down by [close]. */
+    private val dispatcher: ExecutorCoroutineDispatcher = run {
+        val threads = Runtime.getRuntime().availableProcessors().coerceAtLeast(4)
+        Executors.newFixedThreadPool(threads) { runnable ->
+            Thread(runnable, "aelv-netty-io-$id-${transportThreadCounter.incrementAndGet()}")
+                .also { it.isDaemon = true }
+        }.asCoroutineDispatcher()
+    }
+
     private val group = MultiThreadIoEventLoopGroup(
-        eventLoopThreads, DefaultThreadFactory("netty-io"), NioIoHandler.newFactory()
+        eventLoopThreads, DefaultThreadFactory("netty-io-$id"), NioIoHandler.newFactory()
     )
 
-    // Created on first connectUnix call; null until then so close() does not spin
-    // up threads just to destroy them immediately.
     private val nativeGroupRef = AtomicReference<MultiThreadIoEventLoopGroup?>(null)
 
     /**
@@ -71,7 +89,7 @@ class NettyTransport(eventLoopThreads: Int = 1) {
      * If cancelled while the handshake is in flight, the half-opened channel is closed.
      */
     fun connect(host: String, port: Int, tcpOptions: TcpOptions = TcpOptions()): One<NettyConnection> =
-        One.defer(context = NettyDispatchers.io) {
+        One.defer(context = dispatcher) {
             log.connecting("$host:$port")
             connect(group, NioSocketChannel::class.java, java.net.InetSocketAddress(host, port), tcpOptions)
         }
@@ -87,7 +105,7 @@ class NettyTransport(eventLoopThreads: Int = 1) {
      * and are silently ignored.
      */
     fun connectUnix(path: String, @Suppress("UNUSED_PARAMETER") tcpOptions: TcpOptions = TcpOptions()): One<NettyConnection> =
-        One.defer(context = NettyDispatchers.io) {
+        One.defer(context = dispatcher) {
             log.connecting(path)
             val native = nativeGroupRef.get()
                 ?: run {
@@ -96,32 +114,42 @@ class NettyTransport(eventLoopThreads: Int = 1) {
                             "Unix domain sockets require netty-transport-native-epoll (Linux) or " +
                             "netty-transport-native-kqueue (macOS) on the classpath"
                         )
-                    val group = MultiThreadIoEventLoopGroup(
-                        1, DefaultThreadFactory("netty-unix"), resolved.ioHandlerFactory
+                    val ng = MultiThreadIoEventLoopGroup(
+                        1, DefaultThreadFactory("netty-unix-$id"), resolved.ioHandlerFactory
                     )
-                    nativeGroupRef.compareAndSet(null, group)
+                    nativeGroupRef.compareAndSet(null, ng)
                     nativeGroupRef.get()!!
                 }
-            val resolved = resolveNative()!! // already validated above
+            val resolved = resolveNative()!!
             connect(native, resolved.channelClass, resolved.addressFor(path), null)
         }
 
     /**
-     * Shuts down the event loop group(s) and waits for termination.
-     *
-     * Call this on application shutdown after all connections are closed.
+     * Shuts down all owned resources: the Netty event loop group(s) and the coroutine
+     * dispatcher. Must be called after all connections are closed.
      */
-    fun close(): One<Unit> = One.defer(context = NettyDispatchers.io) {
+    /**
+     * Shuts down all owned resources: the Netty event loop group(s) and the coroutine
+     * dispatcher. Must be called after all connections are closed.
+     *
+     * Runs on the caller's context — the transport dispatcher is not used here so it
+     * can be safely closed once the Netty groups drain.
+     */
+    fun close(): One<Unit> = One.defer {
         suspendCancellableCoroutine { continuation ->
             val ng = nativeGroupRef.get()
             group.shutdownGracefully().addListener { mainFuture ->
                 if (ng != null) {
                     ng.shutdownGracefully().addListener { nativeFuture ->
+                        // Listener fires on a Netty IO thread — safe to close the
+                        // dispatcher here since we are not running on it.
+                        dispatcher.close()
                         val cause = mainFuture.cause() ?: nativeFuture.cause()
                         if (cause != null) continuation.resumeWithException(cause)
                         else continuation.resume(Unit)
                     }
                 } else {
+                    dispatcher.close()
                     if (mainFuture.isSuccess) continuation.resume(Unit)
                     else continuation.resumeWithException(mainFuture.cause())
                 }
@@ -162,7 +190,7 @@ class NettyTransport(eventLoopThreads: Int = 1) {
             if (future.isSuccess) {
                 val ch = (future as ChannelFuture).channel()
                 log.connected(ch.id(), ch.remoteAddress())
-                continuation.resume(NettyConnection(ch, handler))
+                continuation.resume(NettyConnection(ch, handler, dispatcher))
             } else {
                 continuation.resumeWithException(future.cause())
             }
@@ -172,11 +200,14 @@ class NettyTransport(eventLoopThreads: Int = 1) {
 
 /** A connected TCP or Unix socket channel with its [InboundHandler] installed. */
 class NettyConnection(
-    val channel:  Channel,
-    internal val handler: InboundHandler,
+    val channel:      Channel,
+    internal val handler:    InboundHandler,
+    internal val dispatcher: ExecutorCoroutineDispatcher,
 ) {
     internal val log = Logging.of<NettyConnection>()
 }
+
+private val transportThreadCounter = AtomicInteger(0)
 
 /**
  * Bridges a Netty channel's inbound byte stream into an aelv [Many].
@@ -403,10 +434,11 @@ fun NettyConnection.inbound(): Many<ByteBuf> = Many.from(handler)
 /**
  * Writes [buf] to the channel and flushes, suspending until Netty confirms completion.
  *
- * Runs on [NettyDispatchers.io]. The caller retains ownership of [buf] — release after
+ * Runs on this connection's transport dispatcher.
+ * The caller retains ownership of [buf] — release after
  * this call if the buffer is reference-counted.
  */
-fun NettyConnection.write(buf: ByteBuf): None<ByteBuf> = None.defer(context = NettyDispatchers.io) {
+fun NettyConnection.write(buf: ByteBuf): None<ByteBuf> = None.defer(context = dispatcher) {
     log.write(channel.id(), buf.readableBytes())
     suspendCancellableCoroutine { continuation ->
         channel.writeAndFlush(buf).addListener { future ->
